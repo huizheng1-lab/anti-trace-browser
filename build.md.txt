@@ -1,0 +1,41 @@
+# Goal: Build a Hardened, Zero-Trace Privacy Browser
+
+## Objective
+Create a lightweight, standalone desktop web browser that leaves absolutely no trace on the host machine. The application must run entirely in volatile memory, save zero history, and ruthlessly eliminate or isolate cookies to prevent cross-site tracking.
+
+## Architecture & Technology Stack
+- **Language:** Python 3
+- **Framework:** PyQt6 (specifically using `PyQt6.QtWebEngineCore` and `PyQt6.QtWebEngineWidgets`)
+- **Reasoning:** PyQt6 provides direct, native access to Chromium’s engine parameters at a low level, allowing precise memory and cookie control without the massive overhead or file bloat of Electron.
+
+## Strict Privacy & Security Requirements
+
+### 1. Ephemeral In-Memory Profile
+- The browser must initialize an off-the-record profile using `QWebEngineProfile(parent)`.
+- **Crucial:** Set the storage name to an empty string `""` or use `QWebEngineProfile.defaultProfile()` configured as off-the-record. This forces Chromium to run entirely in RAM, preventing it from creating local SQLite databases for history, cache, or web storage.
+
+### 2. Radical Cookie & Cache Policy
+- Set the persistent cookie policy to completely disabled: 
+  `profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)`
+- Set the cache type to memory-only: 
+  `profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)`
+- Completely clear the cookie store programmatically upon application launch and on a user-triggered "Wipe" event.
+
+### 3. Native Anti-Tracking / Ad-Blocking
+- Implement a fundamental tracking blocker by intercepting network requests using a custom `QWebEngineUrlRequestInterceptor`.
+- Compile a small, hardcoded list of common telemetry, tracking, and analytics domains (e.g., Google Analytics, DoubleClick) and block any request matching those domains.
+
+### 4. Zero Telemetry & Fingerprint Minimization
+- Mask the standard User-Agent to a generic modern string to minimize browser fingerprinting.
+- Disable features like geolocation permissions, notification popups, and webcam access by default.
+
+## User Interface Requirements
+- A clean, minimal window manager.
+- An address bar that automatically prepends `https://` if a protocol isn't specified.
+- Basic navigation controls: Back, Forward, Refresh, and a Stop button.
+- **The "Nuke" Button:** A highly visible toolbar button labeled "Wipe Session" that instantly clears all memory cache, deletes all session cookies, and resets the current page back to a blank screen (`about:blank`).
+
+## Step-by-Step Implementation Strategy for Claude Code
+1. Verify `pip` has `PyQt6` and `PyQt6-WebEngine` installed locally. If not, install them.
+2. Create a clean modular structure: `main.py` for UI/Application bootstrapping and `privacy_engine.py` for profile customization and request interception.
+3. Launch the browser app instance and verify it initializes cleanly without throwing Python errors or Chromium sandbox segfaults.

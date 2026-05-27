@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Windows artifacts
+*.lnk
+Thumbs.db
+desktop.ini
+
+# Browser runtime / per-session
+atb_session_*/
+probe_out.txt
+
+# Bookmarks — they live in %APPDATA%\AntiTraceBrowser\, never commit them
+bookmarks.json
+*.bookmarks.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
