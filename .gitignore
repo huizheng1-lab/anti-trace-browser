@@ -13,10 +13,16 @@ desktop.ini
 # Browser runtime / per-session
 atb_session_*/
 probe_out.txt
+*_out.txt
 
 # Bookmarks — they live in %APPDATA%\AntiTraceBrowser\, never commit them
 bookmarks.json
 *.bookmarks.json
+
+# API keys — never commit
+minimax_key.txt
+*.key
+.env
 
 # Editor / IDE
 .vscode/
