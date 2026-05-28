@@ -1,72 +1,66 @@
 # Anti-Trace Browser
 
-A lightweight, zero-trace privacy browser for Windows. Real Chromium under the
-hood (Microsoft Edge WebView2 — full proprietary codecs + Widevine DRM), wrapped
-in a wxPython Chrome-style UI. The browsing session lives entirely in a
-temp folder that is shredded on exit; the only thing that survives is the
-bookmarks file you choose to keep.
+A lightweight, zero-trace privacy browser for Windows with a built-in **AI
+agent** that can actually drive the browser. Real Chromium under the hood
+(Microsoft Edge WebView2 — full proprietary codecs + Widevine DRM), wrapped
+in a wxPython Chrome-style UI. The browsing session lives in a temp folder
+that is shredded on exit; the only persistent state is the bookmarks you
+explicitly star.
 
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![engine](https://img.shields.io/badge/engine-Edge%20WebView2-brightgreen)
+![agent](https://img.shields.io/badge/agent-MiniMax%20%2B%20rules-purple)
 
 ## Why this exists
 
-Most "private" or "incognito" modes still leak traces on disk and let trackers
-profile you the moment you log in or accept a cookie. This browser flips the
-defaults:
+Most "private" / "incognito" modes still leak traces on disk and let trackers
+profile you the moment you log in. This browser flips the defaults:
 
 - **Ephemeral profile** — WebView2's user-data folder is a brand-new temp
   directory per run, `shutil.rmtree`-d on exit (and again on `atexit`).
-- **No cookies, cache, or history survive the process.** Everything is
-  in-memory only.
+- **No cookies, cache, or history survive the process** — everything is
+  in-memory.
 - **Generic User-Agent** to reduce browser fingerprinting.
-- **DuckDuckGo** as the default search engine — no query logging, no
-  personal profiling, no tracker-laden ads.
-- **Wipe Session** (`Ctrl+Shift+W`) clears cookies, cache, IndexedDB,
-  `localStorage`, and resets all tabs on demand, mid-session.
-- **Bookmarks** are the *only* persisted state, and they live as a single
-  human-readable JSON file at `%APPDATA%\AntiTraceBrowser\bookmarks.json` —
-  explicit user choices, not invisible tracking. Export/import any time.
+- **DuckDuckGo** as the default search engine — no query logging, no profiling.
+- **Wipe Session** (Ctrl+Shift+W) clears cookies / cache / IndexedDB /
+  localStorage / all tabs on demand, mid-session.
+- **Bookmarks** are the *only* persisted state, in a plain JSON file at
+  `%APPDATA%\AntiTraceBrowser\bookmarks.json` — explicit user choices, not
+  invisible tracking.
 
-## Screenshots
+## What's in the UI
 
-A Chrome-style omnibox over a real Chromium webview, plus a bookmarks bar:
+Top-down Chrome-style layout:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ ← → ↻ ⌂ +   ⎚ Search DuckDuckGo or type a URL — no trace…  ☆ 📚 Wipe│
-│ ⭐ DuckDuckGo   ⭐ YouTube   ⭐ Wikipedia   …                         │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│                       [ web page renders here ]                     │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ ▔ Tab 1 ▔  ▔ Tab 2 ▔  +                              ◄─ tab strip   │
+├──────────────────────────────────────────────────────────────────────┤
+│ ← → ↻ ⌂ +  ⎚ Search or type a URL — no trace…   ☆ 📚 ✨ Wipe        │
+├──────────────────────────────────────────────────────────────────────┤
+│ ⭐ DuckDuckGo  ⭐ YouTube  ⭐ Wikipedia          ◄─ bookmarks bar    │
+├─────────────────────────────────────┬────────────────────────────────┤
+│                                     │  🦆 Duck Agent           ↻ ×  │
+│       [ web page content ]          │                                │
+│                                     │  You: skip the ad              │
+│                                     │  Agent: [click] trusted…       │
+│                                     │                                │
+│                                     ├────────────────────────────────┤
+│                                     │  Ask the agent…   (Enter)  Send│
+└─────────────────────────────────────┴────────────────────────────────┘
 ```
-
-## Architecture
-
-| Layer | Choice | Why |
-|---|---|---|
-| Renderer | **Microsoft Edge WebView2** | Real Chromium with H.264/AAC + Widevine, so YouTube, Netflix-style streams, and adult tube sites actually play. |
-| UI toolkit | **wxPython** (`wx.html2.WebView`) | Native Win32 chrome — proper toolbar, address bar, tabs (`wx.aui.AuiNotebook`), bookmark dialog. No HTML chrome iframes. |
-| Privacy isolation | `WEBVIEW2_USER_DATA_FOLDER` → temp dir + `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` | The whole profile is a folder we own and delete. |
-| Search | DuckDuckGo (`kp=-2&kak=-1`) | No history, no affiliate tags. |
-| Bookmark store | Plain JSON in `%APPDATA%` | Trivially backed up, exported, or moved across machines. |
-
-There's also an earlier `privacy_engine.py` (PyQt6 / QtWebEngine profile-based
-implementation) kept in the tree for reference — the project moved to WebView2
-because the PyPI Qt wheels ship without proprietary codecs, breaking video.
 
 ## Features
 
 ### Browsing
 
-- Chrome-style **omnibox** (URL + search in one pill-shaped bar) with a
-  magnifier/lock icon that swaps based on context.
+- **Chrome-style omnibox** (URL + DuckDuckGo search in one pill-shaped bar)
+  with magnifier/lock icon that swaps based on context.
 - `Ctrl+Enter` → wrap text as `www.<text>.com`; `Shift+Enter` → `.net`.
-- **Tabs** (`wx.aui.AuiNotebook`): `Ctrl+T` new, `Ctrl+W` close, drag to
-  reorder, middle-click closes, `window.open()` and `target="_blank"` honored.
+- **Tabs at the top** (custom `TabStrip` + `wx.Simplebook`): `Ctrl+T` new,
+  `Ctrl+W` close, middle-click closes, click `+` for blank, drag to reorder.
+  `window.open()` and `target="_blank"` honored and routed to new tabs.
 - **Find in page** (`Ctrl+F`), **Fullscreen** (`F11` + page-initiated HTML5
   fullscreen on YouTube etc.).
 - Autoplay unblocked (`--autoplay-policy=no-user-gesture-required`).
@@ -80,25 +74,48 @@ because the PyPI Qt wheels ship without proprietary codecs, breaking video.
   same format Chrome and Firefox use, so you can move bookmarks in/out of a
   real browser.
 
-### Privacy controls
+### Duck Agent — the natural-language browser controller
 
-- **Wipe Session** (`Ctrl+Shift+W`) — closes all extra tabs, JS-clears
-  cookies/localStorage/sessionStorage/Cache API/IndexedDB for the current
-  origin, then calls WebView2's `ClearAllBrowsingData()` to nuke everything
-  across origins, then resets to home.
-- On window close: the WebView2 profile folder is deleted (twice — at
-  `app.MainLoop()` return and via `atexit`).
+Sidepanel toggled with **`Ctrl+G`** or the ✨ toolbar button. Type plain
+English; the agent executes a JSON action. Two layers:
 
-## What about the bookmarks?
+1. **`RuleAgent` (local, instant)** handles unambiguous commands without
+   calling any LLM — `open youtube`, `bookmark this`, `back`, `close tab`,
+   `wipe`, `skip ad`, bare URLs/domains, plus an alias table for popular
+   sites (~25 entries: youtube, gmail, wikipedia, msft rewards, kuaishou…).
+2. **`MinimaxClient` (LLM, fuzzy)** picks up everything the rules don't
+   match — *"find me a recipe for kung pao chicken"*, *"take me somewhere
+   interesting"*, *"open the second result"*, *"summarize this page"*.
 
-They are the *only* persistent state. If you want true zero-state — no file
-on disk between sessions — you can:
+The agent has these actions:
 
-1. Delete `%APPDATA%\AntiTraceBrowser\bookmarks.json` after each run, or
-2. Patch `BookmarkStore.save()` to be a no-op (see `main.py`), or
-3. Just not bookmark anything — without `Ctrl+D` the file is never created.
+| Action | Description |
+|---|---|
+| `navigate` / `new_tab` | Load URL in active / new tab |
+| `search` | DuckDuckGo search in active tab |
+| `page_type` | Type into the current page's search input + submit |
+| `click` | Click element by CSS selector or visible text (polls for late-appearing elements) |
+| `close_tab` / `select_tab` | Manage tabs by index |
+| `bookmark` / `home` / `back` / `forward` / `wipe` | Browser actions |
+| `reply` | Plain text answer (used for summarisation, capabilities explanation) |
 
-The file is plain JSON; back it up to wherever you want.
+**Smart context** — the agent's request to MiniMax always includes:
+
+- `[tabs (active: N)]` — index, title, URL of every open tab.
+- `[links on active page…]` — auto-extracted when you say "click X", so it can
+  pick the right link without an extra round-trip.
+- `[page text…]` — auto-extracted (Reader-mode-style cleanup, capped at 8 KB)
+  when you say "summarize" / "what's this page about" / "key points".
+
+**Multi-step + sequencing** — *"do 5 random searches in bing, recycle the
+same tab"* → 5 `page_type` actions sequenced 2.5 s apart so each result is
+visible before the next replaces it.
+
+**OS-trusted click** — *"skip ad"* on YouTube routes to a `wx.UIActionSimulator`
+mouse click at the button's real screen coordinates, because YouTube's player
+checks `event.isTrusted` and ignores synthetic JavaScript clicks. The cursor
+briefly jumps to the skip button and back; your original cursor position is
+restored.
 
 ## Requirements
 
@@ -113,6 +130,18 @@ The file is plain JSON; back it up to wherever you want.
 py -m pip install wxPython
 ```
 
+To enable the MiniMax-powered agent fallback (optional — without it, you get
+the rule-based agent only):
+
+```powershell
+copy .env.example .env
+# Edit .env and fill in your MINIMAX_API_KEY (get one at minimax.io)
+```
+
+The `.env` file is gitignored. Alternatives in priority order: shell env var
+`MINIMAX_API_KEY`, `%APPDATA%\AntiTraceBrowser\minimax_key.txt`, or a
+`minimax_key.txt` file next to `main.py`.
+
 ## Run
 
 ```powershell
@@ -120,9 +149,6 @@ py main.py
 ```
 
 Or double-click `launch.bat` (uses `pyw.exe` so no console window flashes).
-
-A desktop shortcut with the app's globe icon can be created with PowerShell —
-see `launch.bat` for the target/working-directory pattern.
 
 ## Keyboard shortcuts
 
@@ -143,36 +169,93 @@ see `launch.bat` for the target/working-directory pattern.
 | `Ctrl+Shift+O` | Open bookmark manager |
 | `Ctrl+F` | Find in page |
 | `F11` | Toggle fullscreen |
+| **`Ctrl+G`** | **Toggle Duck Agent side panel** |
+| `↑` / `↓` (in agent input) | Bash-style prompt history |
 | `Ctrl+Shift+W` | Wipe session |
 | `Ctrl+Q` | Quit |
+
+## Agent prompt cheatsheet
+
+```
+open youtube                        # rule, instant
+go to github.com                    # rule, instant
+search for python pyqt6 tutorial    # rule, instant
+new tab to en.wikipedia.org         # rule, instant
+bookmark this                       # rule, instant
+close tab                           # rule, instant
+back / forward / home / wipe        # rule, instant
+skip ad                             # rule, OS-trusted click on YouTube
+
+find me a recipe for kung pao chicken     # MiniMax, rewrites the query
+take me somewhere interesting             # MiniMax, picks a site
+open the first result                     # MiniMax + page-links extraction
+click the wikipedia link                  # MiniMax + page-links extraction
+summarize this page                       # MiniMax + page-text extraction
+what's this page about                    # MiniMax + page-text extraction
+do 3 random searches in bing              # MiniMax, 3 new tabs
+do 30 random searches in bing,            # MiniMax, 30 page_types in the
+   recycle the same tab                   #   same tab, 2.5s apart
+close all bing tabs                       # MiniMax + tab list, multi-close
+```
 
 ## Project layout
 
 ```
 anti-trace-browser/
-├── main.py              # Browser frame, omnibox, tabs, bookmarks, accelerators
-├── privacy_engine.py    # Legacy PyQt6/QtWebEngine privacy profile (reference)
-├── launch.bat           # One-click launcher (uses pyw.exe, no console)
+├── main.py              # everything — frame, omnibox, tabs, bookmarks,
+│                          agent, MiniMax client, click engine
+├── launch.bat           # one-click launcher (uses pyw.exe, no console)
+├── .env.example         # template for MINIMAX_API_KEY / region / model
 ├── probe_codecs.py      # canPlayType() probe — what codecs does this build have
-├── probe_youtube.py     # Real-site test: does YouTube actually play
-├── probe_fullscreen.py  # Confirms document.fullscreenEnabled
-├── probe_newwindow.py   # window.open / target=_blank → new tab handler test
-├── probe_kuaishou.py    # Live-site smoke test (clicks the 直播 button)
-├── logo*.{png,ico}      # Application icon assets
-└── README.md
+├── probe_youtube.py     # real-site test: does YouTube play
+├── probe_fullscreen.py  # confirms document.fullscreenEnabled
+├── probe_newwindow.py   # target=_blank → new tab handler test
+├── probe_kuaishou.py    # Kuaishou 直播 button → new tab test
+├── probe_minimax.py     # MiniMax round-trip / valid-JSON-action test
+├── probe_rules.py       # local rule parser sanity check
+├── probe_multi.py       # multi-action arrays
+├── probe_pagetype.py    # page_type + same-tab sequencing
+├── probe_clicklink.py   # link extraction + LLM picks the right one
+├── probe_click.py       # click selector / text + ad-skip cases
+├── probe_skip.py        # polling click against synthetic late-button
+├── probe_skip_pointer.py # pointerdown listener verification
+├── probe_summarize.py   # page-text extraction + MiniMax summary
+├── probe_tabaware.py    # tab list context, multi-close ordering
+├── probe_yt_live.py     # real YouTube — diagnose + trusted skip
+├── privacy_engine.py    # legacy PyQt6/QtWebEngine profile (reference)
+└── logo*.{png,ico}      # icon assets
 ```
+
+## Privacy posture summary
+
+| What | Where | Survives session? |
+|---|---|---|
+| Cookies | WebView2 in-memory profile | No — temp folder shredded on exit |
+| Cache | WebView2 in-memory profile | No |
+| IndexedDB / localStorage | WebView2 in-memory profile | No |
+| History | Not retained anywhere | No |
+| Browser fingerprint | Generic Chrome/Edge UA | n/a |
+| Search engine | DuckDuckGo (no logging) | n/a |
+| Bookmarks | `%APPDATA%\AntiTraceBrowser\bookmarks.json` | **Yes** (explicit user choice) |
+| Agent conversation | RAM only | No |
+| Prompt history | RAM only | No |
+| MiniMax API key | `.env` file you provide | Local file, gitignored |
 
 ## Known limitations
 
-- **Windows only.** WebView2 is a Windows runtime; `wx.html2.WebView` falls back
-  to other engines on macOS/Linux but with different privacy and codec
-  trade-offs.
-- **DRM is best-effort.** Widevine ships with WebView2 but some streaming sites
-  refuse non-mainstream browsers regardless.
-- **Account-linked tracking still works** if you sign into Google/Facebook/etc.
-  Privacy software can't unlink an account you authenticate to.
-- **Bookmarks file is plaintext.** If your threat model includes someone with
-  filesystem access to `%APPDATA%`, encrypt the file or use full-disk encryption.
+- **Windows only.** WebView2 is a Windows runtime; `wx.html2.WebView` falls
+  back to other engines on macOS/Linux with different privacy/codec trade-offs.
+- **DRM is best-effort.** Widevine ships with WebView2 but some streaming
+  sites refuse non-mainstream browsers regardless.
+- **Account-linked tracking still works** if you sign into
+  Google/Facebook/etc. Privacy software can't unlink an account you authenticate to.
+- **Bookmarks file is plaintext.** Encrypt it / your `%APPDATA%` if your
+  threat model includes someone with filesystem access.
+- **OS-trusted click** for YouTube ad skip requires the browser window to be
+  **visible and not occluded** at the moment of the click. It briefly moves
+  the system cursor.
+- **MiniMax fallback requires a key.** Without one, only `RuleAgent`
+  shortcuts work — still useful for `open X`, `search Y`, `skip ad`, etc.
 
 ## License
 
