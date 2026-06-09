@@ -2268,6 +2268,11 @@ class Browser(wx.Frame):
 
         self.bookmarks = BookmarkStore()
         self._autoskip_on = False  # persistent ad auto-skip toggle
+        self._alive = True
+        # Frame-owned timer drives auto-skip; auto-stops when the frame dies.
+        self._autoskip_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._autoskip_tick, self._autoskip_timer)
+        self.Bind(wx.EVT_CLOSE, self._on_close_frame)
 
         # MiniMax (optional). Loaded from env var or %APPDATA% key file.
         self.minimax: MinimaxClient | None = None
@@ -2375,6 +2380,10 @@ class Browser(wx.Frame):
         x = client_rect.GetLeft() + (screen_w - w) // 2
         y = max(client_rect.GetTop() + 20, client_rect.GetTop() + (screen_h - h) // 2)
         self.SetPosition(wx.Point(x, y))
+
+        # Auto-skip YouTube ads is ON by default. Disable with the ⏭ Skip
+        # toolbar button, Ctrl+Shift+S, or "stop" in the agent.
+        self.set_autoskip(True)
 
     # ---------- toolbar (Chrome-style) ----------
     def _build_toolbar(self):
@@ -2693,6 +2702,19 @@ class Browser(wx.Frame):
         "button[class*='ytp-ad-skip']"
     )
 
+    def _on_close_frame(self, event):
+        # Halt background loops before C++ widgets are torn down.
+        self._alive = False
+        self._autoskip_on = False
+        try:
+            self._autoskip_timer.Stop()
+        except Exception:
+            pass
+        if hasattr(self, "_pending_polls"):
+            for t in self._pending_polls:
+                t["cancelled"] = True
+        event.Skip()
+
     def set_autoskip(self, on: bool):
         """Turn the persistent ad auto-skip watcher on or off. Idempotent."""
         if on == getattr(self, "_autoskip_on", False):
@@ -2704,34 +2726,38 @@ class Browser(wx.Frame):
             self._autoskip_last_click = 0.0
             self.GetStatusBar().SetStatusText(
                 "🔄 Auto-skip ON — ads will be skipped automatically on every tab", 0)
-            wx.CallLater(50, self._autoskip_tick)
+            self._autoskip_timer.Start(600)
         else:
+            self._autoskip_timer.Stop()
             self.GetStatusBar().SetStatusText("Auto-skip OFF", 0)
         self._refresh_autoskip_button()
 
-    def _autoskip_tick(self):
+    def _autoskip_tick(self, event=None):
         import time
-        if not getattr(self, "_autoskip_on", False):
+        # The timer auto-stops on destroy, but guard anyway.
+        if not getattr(self, "_autoskip_on", False) or not getattr(self, "_alive", True):
             return
         wv = self.get_active_webview()  # follow whichever tab is active
-        if wv is not None:
-            try:
-                js = self._LOCATE_JS % (json.dumps(self._AUTOSKIP_SELECTORS), "null")
-                ok, raw = wv.RunScript(js)
-                data = json.loads(raw) if raw else {}
-            except Exception:
-                data = {}
-            # Cooldown so we don't double-click a button that lingers briefly.
-            if data.get("found") and (time.time() - self._autoskip_last_click) > 2.5:
-                wv_screen = wv.ClientToScreen(wx.Point(0, 0))
-                sx = int(wv_screen.x + data["x"])
-                sy = int(wv_screen.y + data["y"])
-                self._do_os_click(sx, sy)
-                self._autoskip_last_click = time.time()
-                self._autoskip_clicks += 1
-                self.GetStatusBar().SetStatusText(
-                    f"🔄 Auto-skip ON — skipped {self._autoskip_clicks} ad(s)", 0)
-        wx.CallLater(600, self._autoskip_tick)
+        if wv is None:
+            return
+        try:
+            js = self._LOCATE_JS % (json.dumps(self._AUTOSKIP_SELECTORS), "null")
+            ok, raw = wv.RunScript(js)
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        # Cooldown so we don't double-click a button that lingers briefly.
+        if data.get("found") and (time.time() - self._autoskip_last_click) > 2.5:
+            wv_screen = wv.ClientToScreen(wx.Point(0, 0))
+            sx = int(wv_screen.x + data["x"])
+            sy = int(wv_screen.y + data["y"])
+            self._do_os_click(sx, sy)
+            self._autoskip_last_click = time.time()
+            self._autoskip_clicks += 1
+            self.GetStatusBar().SetStatusText(
+                f"🔄 Auto-skip ON — skipped {self._autoskip_clicks} ad(s)", 0)
 
     def _refresh_autoskip_button(self):
         btn = getattr(self, "btn_autoskip", None)
