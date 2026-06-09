@@ -123,7 +123,18 @@ form, tick a box, pick a dropdown option, scroll to find a button — it runs an
 
 Because the observation reports current state (`value=…`, `[CHECKED]`,
 `selected=…`), the agent skips sub-tasks that are already done instead of
-toggling them back off.
+toggling them back off. Each element also reports **`ctx=`** — the text of its
+surrounding row/list-item — so the agent can pick the *right* row's control
+(e.g. tick only the promotional emails' checkboxes). For "select all the X"
+goals the step budget rises to 24 and the model may return an array of
+`click_element` actions to select many rows at once.
+
+**Verified end-to-end** with real MiniMax (`probe_agentic.py`):
+
+| Goal | Result |
+|---|---|
+| *"fill the form — name Bob Lee, email …, color Green, agree, Create account"* | All 5 fields/controls set correctly, form submitted ✓ |
+| *"select the promotional emails and move them to trash"* (6-row inbox) | Trashed exactly the 3 promo rows, left the 3 real emails untouched ✓ |
 
 Examples that drive the loop:
 
@@ -132,6 +143,7 @@ fill the search box with cats and submit
 check the agree box, then click sign up
 choose Blue in the colour dropdown and click Create account
 scroll down and click "load more"
+select the promotional emails and move them to trash
 log in with username alice (then it pauses for you to type the password)
 ```
 
@@ -272,6 +284,8 @@ anti-trace-browser/
 ├── probe_tabaware.py    # tab list context, multi-close ordering
 ├── probe_yt_live.py     # real YouTube — diagnose + trusted skip
 ├── probe_interact.py    # observe + index click/fill/select + observe→act loop
+├── probe_agentic.py     # full loop via real MiniMax: form fill + row-aware trash
+├── probe_autoskip_toggle.py # auto-skip toggle arms/clicks/stops
 ├── privacy_engine.py    # legacy PyQt6/QtWebEngine profile (reference)
 └── logo*.{png,ico}      # icon assets
 ```
