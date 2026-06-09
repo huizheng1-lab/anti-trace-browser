@@ -95,17 +95,53 @@ The agent has these actions:
 | `search` | DuckDuckGo search in active tab |
 | `page_type` | Type into the current page's search input + submit |
 | `click` | Click element by CSS selector or visible text (polls for late-appearing elements) |
+| `click_element` / `fill` / `select_option` | Act on an **observed** element by index (see below) |
+| `scroll` | Scroll the page (`down`/`up`/`top`/`bottom`) to reveal controls |
 | `close_tab` / `select_tab` | Manage tabs by index |
 | `bookmark` / `home` / `back` / `forward` / `wipe` | Browser actions |
-| `reply` | Plain text answer (used for summarisation, capabilities explanation) |
+| `reply` / `done` | Plain text answer / finish the task |
 
-**Smart context** — the agent's request to MiniMax always includes:
+### Observe → act loop (Gemini-style page manipulation)
+
+When you ask the agent to *do* something on a page — click a control, fill a
+form, tick a box, pick a dropdown option, scroll to find a button — it runs an
+**agentic loop** instead of guessing:
+
+1. **Observe** — a JS pass catalogs up to 40 visible interactive elements
+   (links, buttons, inputs, selects, checkboxes, role=button/tab/menuitem),
+   tagging each with a stable index and reporting its label, current `value`,
+   `[CHECKED]` state, and selected dropdown option.
+2. **Decide** — that catalog plus the goal goes to MiniMax, which picks the
+   single next index-based action (`click_element`, `fill`, `select_option`,
+   `scroll`).
+3. **Act** — the action runs against the exact element by its index (no fragile
+   selector guessing). Form fields are set via the native value setter so React
+   sees the change; clicks fire a real pointer-event sequence.
+4. **Repeat** — re-observe and continue until the goal is met (the agent emits
+   `done`), capped at 8 steps with an oscillation guard that stops as soon as it
+   would repeat itself.
+
+Because the observation reports current state (`value=…`, `[CHECKED]`,
+`selected=…`), the agent skips sub-tasks that are already done instead of
+toggling them back off.
+
+Examples that drive the loop:
+
+```
+fill the search box with cats and submit
+check the agree box, then click sign up
+choose Blue in the colour dropdown and click Create account
+scroll down and click "load more"
+log in with username alice (then it pauses for you to type the password)
+```
+
+**Smart context** — the agent's request to MiniMax includes, as relevant:
 
 - `[tabs (active: N)]` — index, title, URL of every open tab.
-- `[links on active page…]` — auto-extracted when you say "click X", so it can
-  pick the right link without an extra round-trip.
-- `[page text…]` — auto-extracted (Reader-mode-style cleanup, capped at 8 KB)
-  when you say "summarize" / "what's this page about" / "key points".
+- `[interactive elements …]` — the indexed element catalog (for the act loop).
+- `[links on active page…]` — extracted when you say "click the Nth link".
+- `[page text…]` — Reader-mode cleanup (capped at 8 KB) for "summarize" /
+  "what's this page about".
 
 **Multi-step + sequencing** — *"do 5 random searches in bing, recycle the
 same tab"* → 5 `page_type` actions sequenced 2.5 s apart so each result is
@@ -196,6 +232,12 @@ do 3 random searches in bing              # MiniMax, 3 new tabs
 do 30 random searches in bing,            # MiniMax, 30 page_types in the
    recycle the same tab                   #   same tab, 2.5s apart
 close all bing tabs                       # MiniMax + tab list, multi-close
+
+# observe→act loop (looks at the page, then manipulates it)
+fill the search box with cats and submit
+check the agree box and click sign up
+choose Blue in the dropdown, then click Create account
+scroll down and click load more
 ```
 
 ## Project layout
@@ -222,6 +264,7 @@ anti-trace-browser/
 ├── probe_summarize.py   # page-text extraction + MiniMax summary
 ├── probe_tabaware.py    # tab list context, multi-close ordering
 ├── probe_yt_live.py     # real YouTube — diagnose + trusted skip
+├── probe_interact.py    # observe + index click/fill/select + observe→act loop
 ├── privacy_engine.py    # legacy PyQt6/QtWebEngine profile (reference)
 └── logo*.{png,ico}      # icon assets
 ```

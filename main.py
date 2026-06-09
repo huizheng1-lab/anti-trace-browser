@@ -641,6 +641,17 @@ class RuleAgent:
             return ({"action": "reply", "text": "(empty)"}, True)
         low = s.lower()
 
+        # STOP / CANCEL pending polls — no LLM needed.
+        if low in {"stop", "cancel", "abort", "cancel pending",
+                   "stop agent", "cancel agent", "kill",
+                   "stop skipping", "stop auto skip", "stop autoskip",
+                   "no more skipping", "no more auto skip"}:
+            return ({"action": "cancel"}, True)
+        # AUTO-SKIP — keep watching for every skip button on this/future ads.
+        if low in {"auto skip", "auto skip ad", "auto skip ads", "autoskip",
+                   "skip all ads", "always skip ads", "always skip",
+                   "block ads", "block all ads", "skip every ad"}:
+            return ({"action": "auto_skip"}, True)
         # SKIP YOUTUBE AD — built-in shortcut, no LLM needed.
         if low in {"skip ad", "skip the ad", "skip ads", "skip this ad",
                    "skipad", "skip"}:
@@ -893,8 +904,8 @@ class _DuckWebviewClient:
             cb(False, "")
 
 
-class AgentPanel(wx.Panel):
-    """Chat UI that asks duck.ai to emit a JSON action, then runs it."""
+class _AgentPrompt:
+    """Mixin holding the agent's system prompt (kept separate for readability)."""
 
     SYSTEM_PROMPT = (
         "You control a privacy-focused web browser. Your ONLY output is JSON — "
@@ -920,9 +931,17 @@ class AgentPanel(wx.Panel):
         '                                                    appears, so late-loading buttons like YouTube\'s\n'
         '                                                    skip-ad work (skip button appears after ~5s).\n'
         '  {"action":"click","text":"...","wait_ms":N}       same but match by visible text / aria-label.\n'
+        '  {"action":"click_element","index":N}        click the observed element #N (see [interactive elements]).\n'
+        '  {"action":"fill","index":N,"text":"..."}    type text into observed field #N.\n'
+        '  {"action":"select_option","index":N,"option":"..."}  pick a dropdown option on observed select #N.\n'
+        '  {"action":"scroll","direction":"down|up|top|bottom","amount":700}  scroll the page.\n'
         '  {"action":"bookmark"}                       bookmark active page\n'
         '  {"action":"home"} / {"action":"back"} / {"action":"forward"} / {"action":"wipe"}\n'
         '  {"action":"reply","text":"..."}             ONLY when no action fits\n\n'
+        "PREFER index-based actions (click_element / fill / select_option) when an\n"
+        "[interactive elements] block is present — it lists exactly what is on the\n"
+        "page with stable indices, so they are far more reliable than guessing a\n"
+        "selector or text. Use scroll to reveal elements that are out of view.\n\n"
         "RULES:\n"
         "1. ENGINE-SPECIFIC SEARCH: construct the URL and use navigate.\n"
         "   • 'search bing X'   → navigate https://www.bing.com/search?q=X\n"
@@ -944,7 +963,9 @@ class AgentPanel(wx.Panel):
         "         (try those FIRST before falling back to text:'Skip').\n"
         "       Cookie banners → text:'Accept' or text:'Reject'.\n"
         "       Newsletter popups → text:'Close' or text:'No thanks'.\n"
-        "   • Scrolling / hovering / drag — not supported; use reply to say so.\n"
+        "   • Filling forms / clicking specific controls → use the\n"
+        "     [interactive elements] block + click_element/fill/select_option.\n"
+        "   • Scroll with the scroll action to reach off-screen elements.\n"
         "4. CLEAN UP sloppy queries. 'find me a recipe for kung pao chicken' →\n"
         "   query 'kung pao chicken recipe', NOT 'me a recipe for…'.\n"
         "5. NEW vs ACTIVE: use new_tab only if user explicitly says 'new tab',\n"
@@ -990,6 +1011,12 @@ class AgentPanel(wx.Panel):
         '→ {"action":"click","selector":".ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button, .videoAdUiSkipButton"}\n'
         "User: dismiss this cookie banner\n"
         '→ {"action":"click","text":"Accept"}\n'
+        "User: fill the name with Bob and tick agree (with [interactive elements] showing "
+        "#0 field 'Name', #3 checkbox 'I agree' [unchecked])\n"
+        '→ {"action":"fill","index":0,"text":"Bob"}   (then next step: '
+        '{"action":"click_element","index":3})\n'
+        "User: choose Blue in the colour dropdown (#2 select selected='-- pick --')\n"
+        '→ {"action":"select_option","index":2,"option":"Blue"}\n'
         "User: do 5 random searches in bing, recycle the same tab (active tab is bing.com)\n"
         '→ [{"action":"page_type","text":"deep sea hydrothermal vents"},'
         '{"action":"page_type","text":"history of the saxophone"},'
@@ -1094,13 +1121,81 @@ _CLICK_JS_TEMPLATE = r"""
 """
 
 
-class AgentPanel(wx.Panel):
+# Act on an element previously tagged with data-atb-idx by the observe step.
+# %s placeholders: 1) index (int)  2) op JSON ('click'|'fill'|'select')
+#                  3) value JSON (string for fill/select, else 'null')
+_ACT_ON_INDEX_JS = r"""
+(function(idx, op, value){
+  var el = document.querySelector('[data-atb-idx="' + idx + '"]');
+  if (!el) return 'NO_SUCH_INDEX';
+  try { el.scrollIntoView({block:'center', inline:'center'}); } catch(_){}
+  var label = (el.innerText || el.value || el.getAttribute('aria-label') ||
+               el.getAttribute('placeholder') || el.tagName || '').toString().slice(0,60);
+  function setNativeValue(input, v){
+    var proto = input.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (setter && setter.set) { setter.set.call(input, v); } else { input.value = v; }
+    input.dispatchEvent(new Event('input', {bubbles:true}));
+    input.dispatchEvent(new Event('change', {bubbles:true}));
+  }
+  if (op === 'fill') {
+    if (el.getAttribute('contenteditable') === 'true') {
+      el.focus(); el.textContent = value;
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+    } else {
+      el.focus(); setNativeValue(el, value);
+    }
+    return 'FILLED:' + label;
+  }
+  if (op === 'select') {
+    if (el.tagName.toLowerCase() === 'select') {
+      var want = String(value).toLowerCase().trim();
+      for (var i = 0; i < el.options.length; i++) {
+        var o = el.options[i];
+        if ((o.text || '').toLowerCase().trim().indexOf(want) !== -1 ||
+            (o.value || '').toLowerCase().trim() === want) {
+          el.selectedIndex = i;
+          el.dispatchEvent(new Event('change', {bubbles:true}));
+          return 'SELECTED:' + o.text;
+        }
+      }
+      return 'NO_OPTION';
+    }
+    return 'NOT_A_SELECT';
+  }
+  // default: click — full trusted-ish pointer sequence
+  var r = el.getBoundingClientRect();
+  var cx = r.left + r.width/2, cy = r.top + r.height/2;
+  var PE = window.PointerEvent || MouseEvent;
+  function fire(type, Ctor){
+    try {
+      el.dispatchEvent(new Ctor(type, {
+        bubbles:true, cancelable:true, composed:true, view:window,
+        clientX:cx, clientY:cy, button:0, buttons:1, pointerType:'mouse', isPrimary:true
+      }));
+    } catch(_){}
+  }
+  // Pointer/mouse down+up for sites that track them, then a single native
+  // activation via el.click(). We deliberately do NOT dispatch a synthetic
+  // 'click' event because that would double-toggle checkboxes/radios.
+  fire('pointerover', PE); fire('mouseover', MouseEvent);
+  fire('pointerdown', PE); fire('mousedown', MouseEvent);
+  fire('pointerup', PE);   fire('mouseup', MouseEvent);
+  try { el.click(); } catch(_){}
+  return 'CLICKED:' + label;
+})(%s, %s, %s);
+"""
+
+
+class AgentPanel(_AgentPrompt, wx.Panel):
     """Chat UI that asks duck.ai / MiniMax for a JSON action, then runs it."""
 
     HINTS = (
         "Try: 'open YouTube'  |  'search for python pyqt6 tutorial'  |  "
-        "'new tab to en.wikipedia.org'  |  'bookmark this'  |  'close tab'  |  "
-        "'click the first result'"
+        "'bookmark this'  |  'click the first result'  |  'fill the search box "
+        "with cats and submit'  |  'check the agree box and click sign up'  |  "
+        "'scroll down and click load more'  |  'summarize this page'"
     )
 
     # JS that returns the most useful clickable links on the active page.
@@ -1186,6 +1281,89 @@ class AgentPanel(wx.Panel):
             "key points", "main points", "main idea",
         ))
 
+    # Indexed map of every visible interactive element. Each element gets a
+    # temporary data-atb-idx attribute so later click_element/fill actions hit
+    # exactly the element the model chose — no re-deriving selectors.
+    _EXTRACT_INTERACTIVE_JS = r"""
+    (function(){
+      function isVisible(el){
+        if (!el || !el.getBoundingClientRect) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 2 || r.height <= 2) return false;
+        var cs = window.getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity||'1') > 0.05;
+      }
+      // Clear stale indices from a previous observation.
+      document.querySelectorAll('[data-atb-idx]').forEach(function(e){ e.removeAttribute('data-atb-idx'); });
+      var out = [];
+      var nodes = document.querySelectorAll(
+        'a[href], button, input, select, textarea, [role="button"], [role="link"], ' +
+        '[role="checkbox"], [role="tab"], [role="menuitem"], [onclick], [contenteditable="true"]'
+      );
+      var vh = window.innerHeight;
+      for (var i = 0; i < nodes.length && out.length < 40; i++) {
+        var el = nodes[i];
+        if (!isVisible(el)) continue;
+        var tag = el.tagName.toLowerCase();
+        var type = (el.getAttribute('type') || '').toLowerCase();
+        if (tag === 'input' && type === 'hidden') continue;
+        // Find a human label: aria-label, associated <label>, placeholder,
+        // text content, then value as a last resort.
+        var assocLabel = '';
+        try {
+          if (el.labels && el.labels.length) assocLabel = el.labels[0].innerText || '';
+        } catch(_){}
+        var label = (el.getAttribute('aria-label') || assocLabel || el.innerText ||
+                     el.getAttribute('placeholder') || el.title ||
+                     (type === 'checkbox' || type === 'radio' ? '' : el.value) || ''
+                    ).trim().replace(/\s+/g, ' ').slice(0, 80);
+        if (!label && tag === 'a') continue;  // unlabeled links are useless to the model
+        var idx = out.length;
+        el.setAttribute('data-atb-idx', String(idx));
+        var r = el.getBoundingClientRect();
+        var item = {
+          i: idx, tag: tag, label: label,
+          inView: r.top < vh && r.bottom > 0,
+        };
+        if (type === 'checkbox' || type === 'radio') {
+          item.kind = type;
+          item.checked = !!el.checked;
+        } else if (tag === 'input' || tag === 'textarea' || el.getAttribute('contenteditable') === 'true') {
+          item.kind = 'field';
+          if (type) item.type = type;
+          if (el.value) item.value = String(el.value).slice(0, 40);
+        } else if (tag === 'select') {
+          item.kind = 'select';
+          item.options = Array.prototype.slice.call(el.options, 0, 12).map(function(o){ return o.text.slice(0, 40); });
+          item.selected = (el.selectedIndex >= 0 && el.options[el.selectedIndex])
+                          ? el.options[el.selectedIndex].text.slice(0, 40) : '';
+        } else {
+          item.kind = 'click';
+          if (tag === 'a' && el.href) item.href = el.href.slice(0, 120);
+        }
+        out.push(item);
+      }
+      return JSON.stringify({
+        url: location.href.slice(0, 150),
+        title: (document.title || '').slice(0, 100),
+        scrollY: Math.round(window.scrollY),
+        scrollMax: Math.round(Math.max(0, document.documentElement.scrollHeight - vh)),
+        elements: out,
+      });
+    })();
+    """
+
+    @staticmethod
+    def _wants_interaction(text: str) -> bool:
+        low = text.lower()
+        return any(needle in low for needle in (
+            "click", "press", "fill", "type", "enter", "input", "select",
+            "choose", "check", "tick", "submit", "login", "log in", "sign in",
+            "sign up", "form", "button", "dropdown", "checkbox", "scroll",
+            "accept", "dismiss", "close the", "play", "pause", "expand",
+            "show more", "load more", "next page", "previous page",
+        ))
+
     def __init__(self, parent, browser):
         super().__init__(parent)
         self.browser = browser
@@ -1201,6 +1379,10 @@ class AgentPanel(wx.Panel):
         title = wx.StaticText(header, label="🦆 Duck Agent")
         title.SetFont(wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
         title.SetForegroundColour(OMNIBOX_TEXT)
+        stop_btn = wx.Button(header, label="■", size=wx.Size(26, 26), style=wx.BORDER_NONE)
+        stop_btn.SetBackgroundColour(CHROME_BG)
+        stop_btn.SetForegroundColour(wx.Colour(0xC0, 0x39, 0x2B))
+        stop_btn.SetToolTip("Cancel all pending agent jobs")
         reset_btn = wx.Button(header, label="↻", size=wx.Size(26, 26), style=wx.BORDER_NONE)
         reset_btn.SetBackgroundColour(CHROME_BG)
         reset_btn.SetToolTip("Reset conversation")
@@ -1210,6 +1392,7 @@ class AgentPanel(wx.Panel):
         close_btn.SetToolTip("Hide panel (Ctrl+G)")
         h = wx.BoxSizer(wx.HORIZONTAL)
         h.Add(title, 1, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 10)
+        h.Add(stop_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
         h.Add(reset_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
         h.Add(close_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
         header.SetSizer(h)
@@ -1259,6 +1442,14 @@ class AgentPanel(wx.Panel):
         send_btn.Bind(wx.EVT_BUTTON, lambda e: self._send())
         close_btn.Bind(wx.EVT_BUTTON, lambda e: self.browser._toggle_assistant())
         reset_btn.Bind(wx.EVT_BUTTON, lambda e: self._reset())
+        stop_btn.Bind(wx.EVT_BUTTON, lambda e: self._stop_pending())
+
+    def _stop_pending(self):
+        n = self.browser.cancel_pending_polls()
+        self.cancel_loop()  # also halt any agentic observe→act loop
+        self._busy = False  # also free up the LLM gate if it was set
+        self._append_styled("Agent", f"cancelled {n} pending job(s) + any agent loop",
+                            wx.Colour(0xC0, 0x39, 0x2B))
 
     def _reset(self):
         # Reload the hidden duck.ai page to drop conversation context.
@@ -1325,7 +1516,14 @@ class AgentPanel(wx.Panel):
             self._dispatch(action)
             return
 
-        # Fall through to MiniMax for unrecognised intents.
+        # Interaction goals (click / fill / scroll / multi-step "do X on this
+        # page") go through the Gemini-style observe→act loop, which looks at
+        # the page's interactive elements before each move.
+        if self._wants_interaction(text) and not self._wants_page_text(text):
+            self._run_agentic_loop(text)
+            return
+
+        # Fall through to single-shot MiniMax for other fuzzy intents.
         self._append_styled("Agent", "thinking (MiniMax)…", wx.Colour(0x5F, 0x63, 0x68))
         self._busy = True
         # Full tab list for context.
@@ -1434,6 +1632,150 @@ class AgentPanel(wx.Panel):
         kind = action.get("action", "?")
         desc = self.browser._execute_agent_action(action)
         self._append_styled("Agent", f"[{kind}] {desc}", wx.Colour(0x1A, 0x73, 0xE8))
+
+    # ---------- Gemini-style observe → act loop ----------
+    MAX_AGENT_STEPS = 8
+
+    def _run_agentic_loop(self, goal: str):
+        self._busy = True
+        self._loop_cancel = False
+        self._agent_goal = goal
+        self._agent_steps = 0
+        self._loop_last_sig = None
+        self._agent_messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        self._append_styled("Agent", f"working on: {goal}", wx.Colour(0x5F, 0x63, 0x68))
+        self._agent_step()
+
+    @staticmethod
+    def _action_sig(a: dict) -> str:
+        kind = (a.get("action") or "").lower()
+        # Same control re-filled with different text is NOT a repeat.
+        if kind == "fill":
+            return f"fill:{a.get('index')}:{a.get('text')}"
+        if kind in ("click_element", "select_option", "select_value"):
+            return f"{kind}:{a.get('index')}:{a.get('option') or a.get('value') or ''}"
+        if kind in ("click",):
+            return f"click:{a.get('selector') or a.get('text')}"
+        if kind in ("navigate", "new_tab"):
+            return f"{kind}:{a.get('url')}"
+        if kind == "scroll":
+            return f"scroll:{a.get('direction')}"
+        return kind
+
+    def cancel_loop(self):
+        self._loop_cancel = True
+        self._busy = False
+
+    def _format_observation(self, obs: dict) -> str:
+        if obs.get("error"):
+            return f"[page observation error: {obs['error']}]"
+        els = obs.get("elements", [])
+        lines = []
+        for e in els:
+            label = (e.get("label") or "").strip()
+            extra = ""
+            if e.get("type"):
+                extra += f" type={e['type']}"
+            if e.get("value"):
+                extra += f" value={e['value']!r}"
+            if "checked" in e:
+                extra += " [CHECKED]" if e["checked"] else " [unchecked]"
+            if e.get("options"):
+                extra += f" options={e['options']}"
+            if e.get("selected"):
+                extra += f" selected={e['selected']!r}"
+            if e.get("inView") is False:
+                extra += " (off-screen — scroll to reach)"
+            lines.append(f"  #{e.get('i')} {e.get('kind','')}/{e.get('tag','')}: {label!r}{extra}")
+        head = (f"[interactive elements on {obs.get('url','')} "
+                f"(scroll {obs.get('scrollY')}/{obs.get('scrollMax')}):\n")
+        body = "\n".join(lines) if lines else "  (no interactive elements found)"
+        return head + body + "\n]"
+
+    def _agent_step(self):
+        if getattr(self, "_loop_cancel", False):
+            return
+        if self._agent_steps >= self.MAX_AGENT_STEPS:
+            self._append_styled("Agent", "(reached step limit — stopping)",
+                                wx.Colour(0x99, 0x99, 0x99))
+            self._busy = False
+            return
+        self._agent_steps += 1
+        client = self.browser.minimax
+        if client is None:
+            self._busy = False
+            return
+
+        # Observe the active page (UI thread).
+        obs = self.browser.observe_page()
+        obs_block = self._format_observation(obs)
+
+        # Tab context.
+        active_idx = self.browser.book.GetSelection()
+        tabs_lines = []
+        for i, w in enumerate(self.browser._webviews):
+            tabs_lines.append(f"  {i}: {(w.GetCurrentTitle() or '').strip()!r} @ {(w.GetCurrentURL() or '').strip()}")
+        tabs_block = f"[tabs (active: {active_idx}):\n" + "\n".join(tabs_lines) + "\n]"
+
+        user_turn = (
+            f"GOAL: {self._agent_goal}\n(step {self._agent_steps}/{self.MAX_AGENT_STEPS})\n\n"
+            f"{tabs_block}\n{obs_block}\n"
+            "Decide the SINGLE next action to advance the goal, using index-based "
+            "actions (click_element/fill/select_option) against the elements above. "
+            "Do NOT repeat an action the observation shows is already done: a field "
+            "that already shows the right value=…, a checkbox already [CHECKED], or a "
+            "select already selected=… is COMPLETE — move on to the next sub-task. "
+            "If a needed control is off-screen or absent, scroll first. "
+            'When every part of the goal is satisfied, respond with '
+            '{"action":"done","text":"<short summary of what you did>"}.'
+        )
+        # Keep the conversation bounded: system + last 4 turns.
+        self._agent_messages.append({"role": "user", "content": user_turn})
+        convo = [self._agent_messages[0]] + self._agent_messages[-4:]
+
+        def worker():
+            try:
+                raw = client.chat(convo)
+            except Exception as e:
+                raw = json.dumps({"action": "reply", "text": f"MiniMax error: {e}"})
+            wx.CallAfter(self._agent_after_llm, raw)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _agent_after_llm(self, raw: str):
+        if getattr(self, "_loop_cancel", False):
+            return
+        self._agent_messages.append({"role": "assistant", "content": raw})
+        acts = self._parse_actions(raw) or [{"action": "reply", "text": raw}]
+
+        # Oscillation guard: if the model repeats the exact same action it just
+        # did, the goal is almost certainly already complete — stop cleanly.
+        if acts:
+            sig = self._action_sig(acts[0])
+            if sig and sig == getattr(self, "_loop_last_sig", None) \
+                    and acts[0].get("action") not in ("done", "reply"):
+                self._append_styled("Agent",
+                                    "✓ done (no further progress — the goal looks complete)",
+                                    wx.Colour(0x0F, 0x80, 0x0F))
+                self._busy = False
+                return
+            self._loop_last_sig = sig
+
+        terminal = False
+        for a in acts:
+            kind = (a.get("action") or "").lower()
+            if kind in ("done", "reply"):
+                self._append_styled("Agent", a.get("text") or "(done)",
+                                    wx.Colour(0x0F, 0x80, 0x0F))
+                terminal = True
+                break
+            desc = self.browser._execute_agent_action(a)
+            self._append_styled("Agent", f"[{kind}] {desc}", wx.Colour(0x1A, 0x73, 0xE8))
+        if terminal:
+            self._busy = False
+            return
+        # Let the page apply the action, then observe again and continue.
+        wx.CallLater(1300, self._agent_step)
 
     def _handle_reply(self, raw: str):
         self._busy = False
@@ -2217,16 +2559,43 @@ class Browser(wx.Frame):
     })(%s, %s);
     """
 
+    def cancel_pending_polls(self) -> int:
+        """Mark every in-flight polling job as cancelled. Returns count."""
+        if not hasattr(self, "_pending_polls"):
+            self._pending_polls = []
+        count = sum(1 for t in self._pending_polls if not t.get("cancelled"))
+        for t in self._pending_polls:
+            t["cancelled"] = True
+        self._pending_polls = []
+        return count
+
     def _poll_then_os_click(self, webview, sel, txt, wait_ms: int):
         """Poll the page (every 400ms) for the element, then issue an
         OS-level mouse click at its screen coordinates so the event is
-        actually trusted."""
+        actually trusted. Only one poll runs at a time — firing again
+        cancels the previous job."""
         import time
+        if not hasattr(self, "_pending_polls"):
+            self._pending_polls = []
+        # Cancel any earlier polls — one trusted click at a time.
+        cancelled = self.cancel_pending_polls()
+        if cancelled:
+            self._agent_log(f"(cancelled {cancelled} earlier trusted-click job{'s' if cancelled != 1 else ''})",
+                            wx.Colour(0x99, 0x99, 0x99))
+
+        token = {"cancelled": False, "label": (sel or txt or "")[:40]}
+        self._pending_polls.append(token)
         deadline = time.time() + (wait_ms / 1000.0)
+        start = time.time()
 
         def tick():
+            if token["cancelled"]:
+                return
             if time.time() > deadline:
-                self.GetStatusBar().SetStatusText("trusted click timed out", 0)
+                msg = f"⚠ trusted-click timed out — no match for {(sel or txt)!r} within {wait_ms}ms"
+                self.GetStatusBar().SetStatusText(msg, 0)
+                self._agent_log(msg, wx.Colour(0xC0, 0x39, 0x2B))
+                token["cancelled"] = True
                 return
             js = self._LOCATE_JS % (
                 json.dumps(sel) if sel else "null",
@@ -2238,16 +2607,87 @@ class Browser(wx.Frame):
             except Exception:
                 data = {}
             if data.get("found"):
-                # Convert viewport coords → screen coords.
                 wv_screen = webview.ClientToScreen(wx.Point(0, 0))
                 sx = int(wv_screen.x + data["x"])
                 sy = int(wv_screen.y + data["y"])
                 self._do_os_click(sx, sy)
-                self.GetStatusBar().SetStatusText(f"trusted-click at ({sx},{sy})", 0)
+                elapsed = int((time.time() - start) * 1000)
+                msg = f"✓ trusted-click executed at ({sx},{sy}) after {elapsed}ms"
+                self.GetStatusBar().SetStatusText(msg, 0)
+                self._agent_log(msg, wx.Colour(0x0F, 0x80, 0x0F))
+                token["cancelled"] = True
                 return
             wx.CallLater(400, tick)
 
         wx.CallLater(50, tick)
+
+    # Persistent skip-ad guard — polls indefinitely for YouTube skip buttons
+    # across all ads in a video (pre-roll, mid-roll, etc.).
+    _AUTOSKIP_SELECTORS = (
+        "button.ytp-ad-skip-button-modern, "
+        ".ytp-ad-skip-button-modern, "
+        "button.ytp-skip-ad-button, "
+        ".ytp-skip-ad-button, "
+        "button.ytp-ad-skip-button, "
+        ".ytp-ad-skip-button, "
+        ".ytp-ad-skip-button-container button, "
+        ".videoAdUiSkipButton, "
+        "#skip-button button, "
+        "[id*='skip-button'] button, "
+        "button[class*='skip-ad-button'], "
+        "button[class*='ytp-ad-skip']"
+    )
+
+    def _start_auto_skip(self):
+        """Long-running poll: keeps clicking every skip button that appears
+        on the *currently active* tab until cancelled."""
+        import time
+        if not hasattr(self, "_pending_polls"):
+            self._pending_polls = []
+        self.cancel_pending_polls()
+        token = {"cancelled": False, "label": "auto-skip"}
+        self._pending_polls.append(token)
+        last_click_at = [0.0]
+        click_count = [0]
+        sel_json = json.dumps(self._AUTOSKIP_SELECTORS)
+
+        def tick():
+            if token["cancelled"]:
+                return
+            wv = self.get_active_webview()  # follow whichever tab is active
+            if wv is None:
+                wx.CallLater(800, tick)
+                return
+            try:
+                js = self._LOCATE_JS % (sel_json, "null")
+                ok, raw = wv.RunScript(js)
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            # Cooldown: don't click again within 2.5s of a previous click
+            # (button can linger briefly before being removed).
+            if data.get("found") and (time.time() - last_click_at[0]) > 2.5:
+                wv_screen = wv.ClientToScreen(wx.Point(0, 0))
+                sx = int(wv_screen.x + data["x"])
+                sy = int(wv_screen.y + data["y"])
+                self._do_os_click(sx, sy)
+                last_click_at[0] = time.time()
+                click_count[0] += 1
+                msg = f"✓ auto-skip #{click_count[0]} clicked at ({sx},{sy})"
+                self.GetStatusBar().SetStatusText(msg, 0)
+                self._agent_log(msg, wx.Colour(0x0F, 0x80, 0x0F))
+            wx.CallLater(600, tick)
+
+        self.GetStatusBar().SetStatusText("🔄 auto-skip active — say 'stop' to disable", 0)
+        self._agent_log("🔄 auto-skip armed — will keep watching this tab for skip buttons",
+                        wx.Colour(0x1A, 0x73, 0xE8))
+        wx.CallLater(50, tick)
+
+    def _agent_log(self, msg: str, color):
+        """Append a status line to the Duck Agent transcript if it's open."""
+        panel = getattr(self, "_assistant_panel", None)
+        if panel is not None and isinstance(panel, AgentPanel):
+            wx.CallAfter(panel._append_styled, "Agent", msg, color)
 
     def _do_os_click(self, sx: int, sy: int):
         """Move the OS cursor to (sx, sy) and click. Restores cursor after."""
@@ -2356,6 +2796,15 @@ class Browser(wx.Frame):
     # ---------- AI side panel (agent or chat) ----------
     def _execute_agent_action(self, action: dict) -> str:
         kind = (action.get("action") or "").lower()
+        if kind == "cancel":
+            n = self.cancel_pending_polls()
+            panel = getattr(self, "_assistant_panel", None)
+            if isinstance(panel, AgentPanel):
+                panel.cancel_loop()
+            return f"cancelled {n} pending polling job(s) + any agent loop"
+        if kind == "auto_skip":
+            self._start_auto_skip()
+            return "🔄 auto-skip armed — will click every YouTube skip button (say 'stop' to disable)"
         if kind == "home":
             wv = self.get_active_webview() or self.add_new_tab(HOME_URL, select=True)
             wv.LoadURL(HOME_URL)
@@ -2426,7 +2875,8 @@ class Browser(wx.Frame):
             # mouse input via wx.UIActionSimulator (real input events).
             if action.get("trusted"):
                 self._poll_then_os_click(wv, sel, txt, wait_ms)
-                return f"trusted-click polling for {(sel or txt)!r} (≤{wait_ms}ms)"
+                short = (sel or txt or "").split(",")[0].strip()[:60]
+                return f"watching for '{short}' (≤{wait_ms}ms)…"
             js = _CLICK_JS_TEMPLATE % (
                 json.dumps(sel) if sel else "null",
                 json.dumps(txt) if txt else "null",
@@ -2486,12 +2936,78 @@ class Browser(wx.Frame):
                 return f"typed in page search box: {text!r}"
             except Exception as e:
                 return f"page_type error: {e}"
+        if kind in ("click_element", "fill", "select_option", "select_value"):
+            wv = self.get_active_webview()
+            if not wv:
+                return "no active tab"
+            idx = action.get("index")
+            if not isinstance(idx, int):
+                return "needs an integer 'index' from the observed element list"
+            if kind == "click_element":
+                op, value = "click", "null"
+            elif kind == "fill":
+                op, value = "fill", json.dumps(str(action.get("text", "")))
+            else:
+                op, value = "select", json.dumps(str(action.get("option") or action.get("value", "")))
+            js = _ACT_ON_INDEX_JS % (int(idx), json.dumps(op), value)
+            try:
+                ok, result = wv.RunScript(js)
+                rt = (result or "").strip("'\" ")
+                if rt == "NO_SUCH_INDEX":
+                    return f"element #{idx} no longer exists — observe the page again"
+                if rt == "NO_OPTION":
+                    return f"no matching option for {action.get('option')!r}"
+                if rt.startswith(("CLICKED:", "FILLED:", "SELECTED:")):
+                    verb, _, lbl = rt.partition(":")
+                    return f"{verb.lower()} #{idx}: {lbl}"
+                return f"{kind} #{idx}: {rt}"
+            except Exception as e:
+                return f"{kind} error: {e}"
+        if kind == "scroll":
+            wv = self.get_active_webview()
+            if not wv:
+                return "no active tab"
+            direction = (action.get("direction") or "down").lower()
+            amount = action.get("amount")
+            if not isinstance(amount, int):
+                amount = 700
+            if direction in ("top", "start"):
+                js = "window.scrollTo({top:0,behavior:'smooth'}); 'TOP';"
+            elif direction in ("bottom", "end"):
+                js = "window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'}); 'BOTTOM';"
+            elif direction == "up":
+                js = f"window.scrollBy({{top:-{int(amount)},behavior:'smooth'}}); 'UP';"
+            else:
+                js = f"window.scrollBy({{top:{int(amount)},behavior:'smooth'}}); 'DOWN';"
+            try:
+                wv.RunScript(js)
+                return f"scrolled {direction}"
+            except Exception as e:
+                return f"scroll error: {e}"
+        if kind == "observe":
+            # Returned to the loop, not the user; handled by the caller.
+            return "observed"
         if kind == "bookmark":
             self._toggle_bookmark()
             return "toggled bookmark on active page"
-        if kind == "reply":
-            return action.get("text") or "(no text)"
+        if kind in ("reply", "done"):
+            return action.get("text") or "(done)"
         return f"unknown action '{kind}'"
+
+    # ---------- page observation for the agentic loop ----------
+    def observe_page(self) -> dict:
+        """Catalog visible interactive elements on the active tab. Tags each
+        with data-atb-idx so click_element/fill can act on them by index."""
+        wv = self.get_active_webview()
+        if wv is None:
+            return {"error": "no active tab", "elements": []}
+        try:
+            ok, raw = wv.RunScript(AgentPanel._EXTRACT_INTERACTIVE_JS)
+            if ok and raw:
+                return json.loads(raw)
+        except Exception as e:
+            return {"error": str(e), "elements": []}
+        return {"elements": []}
 
     def _build_assistant_panel(self) -> wx.Panel:
         if ASSISTANT_MODE == "agent":
