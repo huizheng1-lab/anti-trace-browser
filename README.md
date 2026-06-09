@@ -147,6 +147,12 @@ log in with username alice (then it pauses for you to type the password)
 same tab"* → 5 `page_type` actions sequenced 2.5 s apart so each result is
 visible before the next replaces it.
 
+**Auto-skip toggle** — the **⏭ Skip** toolbar button (or `Ctrl+Shift+S`) arms a
+persistent watcher that automatically clicks every YouTube skip button as it
+appears — across pre-rolls, mid-rolls, and tab switches — with no per-ad prompt.
+Turns green when on; click again, press `Ctrl+Shift+S`, or say "stop" to disable.
+Runs entirely locally (no API tokens).
+
 **OS-trusted click** — *"skip ad"* on YouTube routes to a `wx.UIActionSimulator`
 mouse click at the button's real screen coordinates, because YouTube's player
 checks `event.isTrusted` and ignores synthetic JavaScript clicks. The cursor
@@ -206,6 +212,7 @@ Or double-click `launch.bat` (uses `pyw.exe` so no console window flashes).
 | `Ctrl+F` | Find in page |
 | `F11` | Toggle fullscreen |
 | **`Ctrl+G`** | **Toggle Duck Agent side panel** |
+| **`Ctrl+Shift+S`** | **Toggle auto-skip YouTube ads** (also the ⏭ Skip toolbar button) |
 | `↑` / `↓` (in agent input) | Bash-style prompt history |
 | `Ctrl+Shift+W` | Wipe session |
 | `Ctrl+Q` | Quit |

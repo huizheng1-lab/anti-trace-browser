@@ -357,7 +357,7 @@ def resolve(text: str) -> str:
 
 
 # Tool IDs
-ID_BACK, ID_FWD, ID_RELOAD, ID_STOP, ID_HOME, ID_GO, ID_WIPE, ID_NEW_TAB, ID_CLOSE_TAB, ID_STAR, ID_TOGGLE_BMBAR, ID_BM_MGR, ID_GEMINI = (wx.NewIdRef() for _ in range(13))
+ID_BACK, ID_FWD, ID_RELOAD, ID_STOP, ID_HOME, ID_GO, ID_WIPE, ID_NEW_TAB, ID_CLOSE_TAB, ID_STAR, ID_TOGGLE_BMBAR, ID_BM_MGR, ID_GEMINI, ID_AUTOSKIP = (wx.NewIdRef() for _ in range(14))
 
 GEMINI_URL = "https://gemini.google.com/"
 DUCKAI_URL = "https://duck.ai/"
@@ -1468,9 +1468,10 @@ class AgentPanel(_AgentPrompt, wx.Panel):
 
     def _stop_pending(self):
         n = self.browser.cancel_pending_polls()
+        self.browser.set_autoskip(False)  # also turn off the auto-skip toggle
         self.cancel_loop()  # also halt any agentic observe→act loop
         self._busy = False  # also free up the LLM gate if it was set
-        self._append_styled("Agent", f"cancelled {n} pending job(s) + any agent loop",
+        self._append_styled("Agent", f"cancelled {n} pending job(s); auto-skip OFF",
                             wx.Colour(0xC0, 0x39, 0x2B))
 
     def _reset(self):
@@ -2266,6 +2267,7 @@ class Browser(wx.Frame):
             self.SetIcon(wx.Icon(logo_path, wx.BITMAP_TYPE_ICO))
 
         self.bookmarks = BookmarkStore()
+        self._autoskip_on = False  # persistent ad auto-skip toggle
 
         # MiniMax (optional). Loaded from env var or %APPDATA% key file.
         self.minimax: MinimaxClient | None = None
@@ -2334,8 +2336,10 @@ class Browser(wx.Frame):
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT,   ord('B'),       ID_TOGGLE_BMBAR),
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT,   ord('O'),       ID_BM_MGR),
             (wx.ACCEL_CTRL,                    ord('G'),       ID_GEMINI),
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT,   ord('S'),       ID_AUTOSKIP),
         ])
         self.SetAcceleratorTable(accel)
+        self.Bind(wx.EVT_MENU, lambda e: self.set_autoskip(not self._autoskip_on), id=ID_AUTOSKIP)
         self.Bind(wx.EVT_MENU, lambda e: self._find_in_page(), id=ID_FIND)
         self.Bind(wx.EVT_MENU, lambda e: self._toggle_fullscreen(), id=ID_FULLSCREEN)
         self.Bind(wx.EVT_MENU, lambda e: self.address.SetFocusOnText(), id=ID_FOCUS_OMNI)
@@ -2397,6 +2401,13 @@ class Browser(wx.Frame):
         self.btn_star   = round_btn(ID_STAR, "☆", "Bookmark this page (Ctrl+D)")
         self.btn_bm_mgr = round_btn(ID_BM_MGR, "📚", "Bookmark manager (Ctrl+Shift+O)")
         self.btn_gemini = round_btn(ID_GEMINI, "✨", "Toggle AI side panel (Ctrl+G)")
+        # Auto-skip toggle (text label so the ON/OFF state is obvious).
+        self.btn_autoskip = wx.Button(bar, label="⏭ Skip", size=wx.Size(78, 32),
+                                      style=wx.BORDER_NONE)
+        self.btn_autoskip.SetBackgroundColour(CHROME_BG)
+        self.btn_autoskip.SetForegroundColour(wx.Colour(0x20, 0x21, 0x24))
+        self.btn_autoskip.SetFont(wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        self.btn_autoskip.SetToolTip("Auto-skip YouTube ads (off) — click to turn on")
         self.btn_wipe   = wx.Button(bar, id=ID_WIPE, label="Wipe", size=wx.Size(64, 32),
                                     style=wx.BORDER_NONE)
         self.btn_wipe.SetBackgroundColour(wx.Colour(0xC0, 0x39, 0x2B))
@@ -2417,6 +2428,7 @@ class Browser(wx.Frame):
         sizer.Add(self.btn_star, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
         sizer.Add(self.btn_bm_mgr, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
         sizer.Add(self.btn_gemini, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        sizer.Add(self.btn_autoskip, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         sizer.Add(self.btn_wipe, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         bar.SetSizer(sizer)
         bar.SetMinSize(wx.Size(-1, 48))
@@ -2430,6 +2442,7 @@ class Browser(wx.Frame):
         self.btn_star.Bind(wx.EVT_BUTTON, lambda e: self._toggle_bookmark())
         self.btn_bm_mgr.Bind(wx.EVT_BUTTON, lambda e: self._open_bookmark_manager())
         self.btn_gemini.Bind(wx.EVT_BUTTON, lambda e: self._toggle_assistant())
+        self.btn_autoskip.Bind(wx.EVT_BUTTON, lambda e: self.set_autoskip(not getattr(self, "_autoskip_on", False)))
         self.btn_wipe.Bind(wx.EVT_BUTTON, self._on_wipe)
 
     # ---------- API / Helper Methods ----------
@@ -2680,50 +2693,62 @@ class Browser(wx.Frame):
         "button[class*='ytp-ad-skip']"
     )
 
-    def _start_auto_skip(self):
-        """Long-running poll: keeps clicking every skip button that appears
-        on the *currently active* tab until cancelled."""
-        import time
-        if not hasattr(self, "_pending_polls"):
-            self._pending_polls = []
-        self.cancel_pending_polls()
-        token = {"cancelled": False, "label": "auto-skip"}
-        self._pending_polls.append(token)
-        last_click_at = [0.0]
-        click_count = [0]
-        sel_json = json.dumps(self._AUTOSKIP_SELECTORS)
+    def set_autoskip(self, on: bool):
+        """Turn the persistent ad auto-skip watcher on or off. Idempotent."""
+        if on == getattr(self, "_autoskip_on", False):
+            self._refresh_autoskip_button()
+            return
+        self._autoskip_on = on
+        if on:
+            self._autoskip_clicks = 0
+            self._autoskip_last_click = 0.0
+            self.GetStatusBar().SetStatusText(
+                "🔄 Auto-skip ON — ads will be skipped automatically on every tab", 0)
+            wx.CallLater(50, self._autoskip_tick)
+        else:
+            self.GetStatusBar().SetStatusText("Auto-skip OFF", 0)
+        self._refresh_autoskip_button()
 
-        def tick():
-            if token["cancelled"]:
-                return
-            wv = self.get_active_webview()  # follow whichever tab is active
-            if wv is None:
-                wx.CallLater(800, tick)
-                return
+    def _autoskip_tick(self):
+        import time
+        if not getattr(self, "_autoskip_on", False):
+            return
+        wv = self.get_active_webview()  # follow whichever tab is active
+        if wv is not None:
             try:
-                js = self._LOCATE_JS % (sel_json, "null")
+                js = self._LOCATE_JS % (json.dumps(self._AUTOSKIP_SELECTORS), "null")
                 ok, raw = wv.RunScript(js)
                 data = json.loads(raw) if raw else {}
             except Exception:
                 data = {}
-            # Cooldown: don't click again within 2.5s of a previous click
-            # (button can linger briefly before being removed).
-            if data.get("found") and (time.time() - last_click_at[0]) > 2.5:
+            # Cooldown so we don't double-click a button that lingers briefly.
+            if data.get("found") and (time.time() - self._autoskip_last_click) > 2.5:
                 wv_screen = wv.ClientToScreen(wx.Point(0, 0))
                 sx = int(wv_screen.x + data["x"])
                 sy = int(wv_screen.y + data["y"])
                 self._do_os_click(sx, sy)
-                last_click_at[0] = time.time()
-                click_count[0] += 1
-                msg = f"✓ auto-skip #{click_count[0]} clicked at ({sx},{sy})"
-                self.GetStatusBar().SetStatusText(msg, 0)
-                self._agent_log(msg, wx.Colour(0x0F, 0x80, 0x0F))
-            wx.CallLater(600, tick)
+                self._autoskip_last_click = time.time()
+                self._autoskip_clicks += 1
+                self.GetStatusBar().SetStatusText(
+                    f"🔄 Auto-skip ON — skipped {self._autoskip_clicks} ad(s)", 0)
+        wx.CallLater(600, self._autoskip_tick)
 
-        self.GetStatusBar().SetStatusText("🔄 auto-skip active — say 'stop' to disable", 0)
-        self._agent_log("🔄 auto-skip armed — will keep watching this tab for skip buttons",
-                        wx.Colour(0x1A, 0x73, 0xE8))
-        wx.CallLater(50, tick)
+    def _refresh_autoskip_button(self):
+        btn = getattr(self, "btn_autoskip", None)
+        if btn is None:
+            return
+        on = getattr(self, "_autoskip_on", False)
+        if on:
+            btn.SetLabel("⏭ Skip: ON")
+            btn.SetBackgroundColour(wx.Colour(0x0F, 0x80, 0x0F))
+            btn.SetForegroundColour(wx.WHITE)
+            btn.SetToolTip("Auto-skip is ON — click to turn off")
+        else:
+            btn.SetLabel("⏭ Skip")
+            btn.SetBackgroundColour(CHROME_BG)
+            btn.SetForegroundColour(wx.Colour(0x20, 0x21, 0x24))
+            btn.SetToolTip("Auto-skip YouTube ads (off) — click to turn on")
+        btn.Refresh()
 
     def _agent_log(self, msg: str, color):
         """Append a status line to the Duck Agent transcript if it's open."""
@@ -2840,13 +2865,14 @@ class Browser(wx.Frame):
         kind = (action.get("action") or "").lower()
         if kind == "cancel":
             n = self.cancel_pending_polls()
+            self.set_autoskip(False)  # "stop" also disables the auto-skip toggle
             panel = getattr(self, "_assistant_panel", None)
             if isinstance(panel, AgentPanel):
                 panel.cancel_loop()
-            return f"cancelled {n} pending polling job(s) + any agent loop"
+            return f"cancelled {n} pending polling job(s) + any agent loop; auto-skip OFF"
         if kind == "auto_skip":
-            self._start_auto_skip()
-            return "🔄 auto-skip armed — will click every YouTube skip button (say 'stop' to disable)"
+            self.set_autoskip(True)
+            return "🔄 auto-skip ON — ads will be skipped automatically (toolbar button or 'stop' to disable)"
         if kind == "home":
             wv = self.get_active_webview() or self.add_new_tab(HOME_URL, select=True)
             wv.LoadURL(HOME_URL)
