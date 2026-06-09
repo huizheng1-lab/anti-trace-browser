@@ -1325,6 +1325,28 @@ class AgentPanel(_AgentPrompt, wx.Panel):
           i: idx, tag: tag, label: label,
           inView: r.top < vh && r.bottom > 0,
         };
+        // Row context: the text of the nearest list-row / table-row / list-item
+        // ancestor, so the model can tell WHICH item a control (e.g. a checkbox)
+        // belongs to — essential for "select the promo emails" style tasks.
+        var ctx = '';
+        try {
+          var p = el.parentElement, hops = 0;
+          while (p && p !== document.body && hops < 8) {
+            var role = (p.getAttribute && p.getAttribute('role')) || '';
+            var ptag = p.tagName.toLowerCase();
+            if (ptag === 'tr' || ptag === 'li' || role === 'row' || role === 'listitem' ||
+                role === 'article' || ptag === 'article') {
+              ctx = (p.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 140);
+              break;
+            }
+            p = p.parentElement; hops++;
+          }
+          if (!ctx && el.parentElement) {
+            var t = (el.parentElement.innerText || '').trim().replace(/\s+/g, ' ');
+            if (t && t.length <= 160) ctx = t.slice(0, 140);
+          }
+        } catch(_){}
+        if (ctx && ctx !== label) item.context = ctx;
         if (type === 'checkbox' || type === 'radio') {
           item.kind = type;
           item.checked = !!el.checked;
@@ -1635,6 +1657,16 @@ class AgentPanel(_AgentPrompt, wx.Panel):
 
     # ---------- Gemini-style observe → act loop ----------
     MAX_AGENT_STEPS = 8
+    MAX_AGENT_STEPS_BATCH = 24  # higher budget for "select all the X and ..." tasks
+
+    @staticmethod
+    def _is_batch_goal(goal: str) -> bool:
+        low = goal.lower()
+        return any(w in low for w in (
+            "all the", "all ", "every", "each", "promo", "promotion",
+            "newsletter", "select the", "delete the", "trash the",
+            "archive the", "unsubscribe", "mark as read",
+        ))
 
     def _run_agentic_loop(self, goal: str):
         self._busy = True
@@ -1684,6 +1716,8 @@ class AgentPanel(_AgentPrompt, wx.Panel):
                 extra += f" options={e['options']}"
             if e.get("selected"):
                 extra += f" selected={e['selected']!r}"
+            if e.get("context"):
+                extra += f" ctx={e['context']!r}"
             if e.get("inView") is False:
                 extra += " (off-screen — scroll to reach)"
             lines.append(f"  #{e.get('i')} {e.get('kind','')}/{e.get('tag','')}: {label!r}{extra}")
@@ -1695,7 +1729,9 @@ class AgentPanel(_AgentPrompt, wx.Panel):
     def _agent_step(self):
         if getattr(self, "_loop_cancel", False):
             return
-        if self._agent_steps >= self.MAX_AGENT_STEPS:
+        step_cap = (self.MAX_AGENT_STEPS_BATCH
+                    if self._is_batch_goal(self._agent_goal) else self.MAX_AGENT_STEPS)
+        if self._agent_steps >= step_cap:
             self._append_styled("Agent", "(reached step limit — stopping)",
                                 wx.Colour(0x99, 0x99, 0x99))
             self._busy = False
@@ -1720,11 +1756,17 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         user_turn = (
             f"GOAL: {self._agent_goal}\n(step {self._agent_steps}/{self.MAX_AGENT_STEPS})\n\n"
             f"{tabs_block}\n{obs_block}\n"
-            "Decide the SINGLE next action to advance the goal, using index-based "
+            "Decide the next action(s) to advance the goal, using index-based "
             "actions (click_element/fill/select_option) against the elements above. "
+            "Each element may include ctx='…' = the text of its row/list-item; use "
+            "it to pick the RIGHT row's control (e.g. for 'select promotional emails', "
+            "click_element the checkbox of each row whose ctx looks like a promo / "
+            "newsletter / marketing message, then click the Trash/Delete button). "
+            "For selecting MULTIPLE list items you MAY return a JSON ARRAY of "
+            "click_element actions in one response. "
             "Do NOT repeat an action the observation shows is already done: a field "
-            "that already shows the right value=…, a checkbox already [CHECKED], or a "
-            "select already selected=… is COMPLETE — move on to the next sub-task. "
+            "with the right value=…, a checkbox already [CHECKED], or a select already "
+            "selected=… is COMPLETE — move on. "
             "If a needed control is off-screen or absent, scroll first. "
             'When every part of the goal is satisfied, respond with '
             '{"action":"done","text":"<short summary of what you did>"}.'
