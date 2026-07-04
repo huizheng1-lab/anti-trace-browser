@@ -1378,13 +1378,36 @@ class AgentPanel(_AgentPrompt, wx.Panel):
     @staticmethod
     def _wants_interaction(text: str) -> bool:
         low = text.lower()
-        return any(needle in low for needle in (
+        # Direct interaction verbs.
+        if any(needle in low for needle in (
             "click", "press", "fill", "type", "enter", "input", "select",
             "choose", "check", "tick", "submit", "login", "log in", "sign in",
             "sign up", "form", "button", "dropdown", "checkbox", "scroll",
             "accept", "dismiss", "close the", "play", "pause", "expand",
             "show more", "load more", "next page", "previous page",
-        ))
+            "add to cart", "add to basket", "follow the", "go to the",
+            "navigate to the", "visit the", "read more", "expand the",
+        )):
+            return True
+        # Browse phrasings that refer to a link/section ON the current page.
+        # ("open X" / "go to X" for known sites/URLs is handled by RuleAgent;
+        # anything that falls through to here and names an on-page target
+        # should drive the observe→click loop.)
+        onpage_targets = (
+            "article", "story", "headline", "result", "link", "post",
+            "listing", "item", "thread", "video", "product", "section",
+            "tab", "menu", "heading", "entry",
+        )
+        actiony = ("open ", "read ", "go to ", "find ", "select ", "pick ",
+                   "view ", "look at ", "take me to ")
+        if any(low.startswith(v) or (" " + v) in low for v in actiony) and \
+           any(t in low for t in onpage_targets):
+            return True
+        # Ordinal references almost always mean "act on the Nth thing here".
+        if any(o in low for o in ("first ", "second ", "third ", "top ", "last ")) and \
+           any(v in low for v in ("open", "read", "click", "go", "visit", "view", "pick", "select")):
+            return True
+        return False
 
     def __init__(self, parent, browser):
         super().__init__(parent)
@@ -1817,8 +1840,29 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         if terminal:
             self._busy = False
             return
-        # Let the page apply the action, then observe again and continue.
-        wx.CallLater(1300, self._agent_step)
+        # Let the page apply the action (or a navigation to finish) before the
+        # next observation. Clicking a link often navigates — re-observing too
+        # soon would catch a blank/old page — so poll document.readyState.
+        self._settle_then_step(elapsed=0)
+
+    def _settle_then_step(self, elapsed: int):
+        """Wait until the active page is 'complete' (or ~6s), then re-observe."""
+        if getattr(self, "_loop_cancel", False):
+            return
+        MIN_WAIT, MAX_WAIT = 700, 6000
+        wv = self.browser.get_active_webview()
+        ready = False
+        if wv is not None:
+            try:
+                ok, raw = wv.RunScript("document.readyState")
+                ready = (raw or "").strip("'\" ") == "complete"
+            except Exception:
+                ready = False
+        # Always give at least MIN_WAIT for in-page DOM updates to render.
+        if (ready and elapsed >= MIN_WAIT) or elapsed >= MAX_WAIT:
+            wx.CallLater(300, self._agent_step)
+            return
+        wx.CallLater(350, lambda: self._settle_then_step(elapsed + 350))
 
     def _handle_reply(self, raw: str):
         self._busy = False

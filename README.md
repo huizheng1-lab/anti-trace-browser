@@ -135,6 +135,13 @@ goals the step budget rises to 24 and the model may return an array of
 |---|---|
 | *"fill the form — name Bob Lee, email …, color Green, agree, Create account"* | All 5 fields/controls set correctly, form submitted ✓ |
 | *"select the promotional emails and move them to trash"* (6-row inbox) | Trashed exactly the 3 promo rows, left the 3 real emails untouched ✓ |
+| *"open the breaking news story about the park, then recommend the article"* | Picked the right story link (ignoring nav/ads), **navigated to the new page**, then clicked Recommend on it ✓ |
+
+The last case proves genuine **multi-page browsing**: click a link → wait for the
+new page to load (the loop polls `document.readyState` before re-observing) →
+act on the destination. Browse phrasings like *"open the top story"*, *"read the
+first article"*, *"go to the about page"*, *"click the first result"* all route
+into the loop automatically.
 
 Examples that drive the loop:
 
@@ -285,6 +292,7 @@ anti-trace-browser/
 ├── probe_yt_live.py     # real YouTube — diagnose + trusted skip
 ├── probe_interact.py    # observe + index click/fill/select + observe→act loop
 ├── probe_agentic.py     # full loop via real MiniMax: form fill + row-aware trash
+├── probe_browse.py      # multi-page browsing: click link → navigate → act (localhost)
 ├── probe_autoskip_toggle.py # auto-skip toggle arms/clicks/stops
 ├── privacy_engine.py    # legacy PyQt6/QtWebEngine profile (reference)
 └── logo*.{png,ico}      # icon assets
