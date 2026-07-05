@@ -1541,9 +1541,32 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         self._history_idx = None
         evt.Skip()
 
+    # If the agent has been "busy" for longer than this with no completion,
+    # something went wrong silently (e.g. an unhandled exception in an action
+    # handler) — treat it as stuck rather than blocking the user forever.
+    BUSY_STUCK_SECONDS = 25
+
     def _send(self):
         if self._busy:
-            return
+            import time
+            stale = (time.time() - getattr(self, "_busy_since", 0)) > self.BUSY_STUCK_SECONDS
+            if not stale:
+                self._append_styled(
+                    "Agent",
+                    "⏳ still working on the previous request — press ■ Stop to cancel it, "
+                    "or wait a moment.",
+                    wx.Colour(0x99, 0x99, 0x99),
+                )
+                return
+            # Stuck: recover instead of silently swallowing every message forever.
+            self.browser.cancel_pending_polls()
+            self.cancel_loop()
+            self._busy = False
+            self._append_styled(
+                "Agent",
+                "⚠ recovered from a stuck state (previous request never completed) — continuing…",
+                wx.Colour(0xC0, 0x39, 0x2B),
+            )
         text = self.input.GetValue().strip()
         if not text:
             return
@@ -1571,7 +1594,9 @@ class AgentPanel(_AgentPrompt, wx.Panel):
 
         # Fall through to single-shot MiniMax for other fuzzy intents.
         self._append_styled("Agent", "thinking (MiniMax)…", wx.Colour(0x5F, 0x63, 0x68))
+        import time
         self._busy = True
+        self._busy_since = time.time()
         # Full tab list for context.
         active_idx = self.browser.book.GetSelection()
         tabs_lines = []
@@ -1688,7 +1713,10 @@ class AgentPanel(_AgentPrompt, wx.Panel):
 
     def _dispatch(self, action: dict):
         kind = action.get("action", "?")
-        desc = self.browser._execute_agent_action(action)
+        try:
+            desc = self.browser._execute_agent_action(action)
+        except Exception as e:
+            desc = f"error — {e}"
         self._append_styled("Agent", f"[{kind}] {desc}", wx.Colour(0x1A, 0x73, 0xE8))
 
     # ---------- Gemini-style observe → act loop ----------
@@ -1705,7 +1733,9 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         ))
 
     def _run_agentic_loop(self, goal: str):
+        import time
         self._busy = True
+        self._busy_since = time.time()
         self._loop_cancel = False
         self._agent_goal = goal
         self._agent_steps = 0
@@ -1765,6 +1795,17 @@ class AgentPanel(_AgentPrompt, wx.Panel):
     def _agent_step(self):
         if getattr(self, "_loop_cancel", False):
             return
+        import time
+        self._busy_since = time.time()  # reset so the stuck-watchdog only fires per-step
+        try:
+            self._agent_step_body()
+        except Exception as e:
+            # Never let an exception here leave _busy stuck true forever —
+            # that would silently drop every future message with no feedback.
+            self._append_styled("Agent", f"⚠ internal error — {e}", wx.Colour(0xC0, 0x39, 0x2B))
+            self._busy = False
+
+    def _agent_step_body(self):
         step_cap = (self.MAX_AGENT_STEPS_BATCH
                     if self._is_batch_goal(self._agent_goal) else self.MAX_AGENT_STEPS)
         if self._agent_steps >= step_cap:
@@ -1823,6 +1864,15 @@ class AgentPanel(_AgentPrompt, wx.Panel):
     def _agent_after_llm(self, raw: str):
         if getattr(self, "_loop_cancel", False):
             return
+        try:
+            self._agent_after_llm_body(raw)
+        except Exception as e:
+            # Same rationale as _agent_step's guard: an uncaught exception in
+            # a wx.CallAfter callback must never leave _busy stuck true.
+            self._append_styled("Agent", f"⚠ internal error — {e}", wx.Colour(0xC0, 0x39, 0x2B))
+            self._busy = False
+
+    def _agent_after_llm_body(self, raw: str):
         self._agent_messages.append({"role": "assistant", "content": raw})
         acts = self._parse_actions(raw) or [{"action": "reply", "text": raw}]
 
@@ -1847,8 +1897,20 @@ class AgentPanel(_AgentPrompt, wx.Panel):
                                     wx.Colour(0x0F, 0x80, 0x0F))
                 terminal = True
                 break
-            desc = self.browser._execute_agent_action(a)
+            # Never let an action-handler exception leave the agent stuck:
+            # without this guard, one bad action (malformed args, a JS error
+            # that escapes RunScript, etc.) would raise out of this
+            # wx.CallAfter callback, get silently swallowed by wx, and leave
+            # _busy=True forever — every future message would then be
+            # dropped with zero feedback.
+            try:
+                desc = self.browser._execute_agent_action(a)
+            except Exception as e:
+                desc = f"error — {e}"
+                terminal = True
             self._append_styled("Agent", f"[{kind}] {desc}", wx.Colour(0x1A, 0x73, 0xE8))
+            if terminal:
+                break
         if terminal:
             self._busy = False
             return
@@ -1883,7 +1945,10 @@ class AgentPanel(_AgentPrompt, wx.Panel):
             self._append_styled("Agent", raw.strip() or "(empty reply)", wx.Colour(0x20, 0x21, 0x24))
             return
         kind = action.get("action") or "?"
-        desc = self.browser._execute_agent_action(action)
+        try:
+            desc = self.browser._execute_agent_action(action)
+        except Exception as e:
+            desc = f"error — {e}"
         self._append_styled("Agent", f"[{kind}] {desc}", wx.Colour(0x1A, 0x73, 0xE8))
 
     @staticmethod

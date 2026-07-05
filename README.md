@@ -172,6 +172,17 @@ burst to sites' abuse detection — 10 near-simultaneous hits to
 on 8 of them before this fix; spaced out like a person actually opening tabs,
 all 10 come back as real results (`probe_multi_search_spacing.py`).
 
+**Reliability: the assistant can't go silent.** Every action handler runs
+under a try/except so a single bad action (a stale element index, a JS error,
+a malformed LLM response) can't leave the agent stuck — earlier, an uncaught
+exception mid-action would silently freeze the "busy" gate forever and every
+future message would be dropped with zero feedback. Now: (1) errors surface
+in the transcript instead of vanishing, (2) sending a message while the agent
+is genuinely still working shows *"⏳ still working — press ■ Stop…"* instead
+of doing nothing, and (3) if the gate ever does get stuck, the next message
+self-heals it with a *"⚠ recovered from a stuck state"* notice and proceeds
+(`probe_busy_recovery.py`).
+
 **Auto-skip toggle** — the **⏭ Skip** toolbar button (or `Ctrl+Shift+S`) arms a
 persistent watcher that automatically clicks every YouTube skip button as it
 appears — across pre-rolls, mid-rolls, and tab switches — with no per-ad prompt.
@@ -290,6 +301,7 @@ anti-trace-browser/
 ├── probe_multi.py       # multi-action arrays
 ├── probe_search10.py    # "search randomly in google for 10 times" — rule/LLM routing + raw output
 ├── probe_multi_search_spacing.py # multi new_tab actions are paced, not bursted
+├── probe_busy_recovery.py # busy-gate can't get stuck; errors surface, self-heals
 ├── probe_pagetype.py    # page_type + same-tab sequencing
 ├── probe_clicklink.py   # link extraction + LLM picks the right one
 ├── probe_click.py       # click selector / text + ad-skip cases
