@@ -164,7 +164,13 @@ log in with username alice (then it pauses for you to type the password)
 
 **Multi-step + sequencing** — *"do 5 random searches in bing, recycle the
 same tab"* → 5 `page_type` actions sequenced 2.5 s apart so each result is
-visible before the next replaces it.
+visible before the next replaces it. *"search randomly in google for 10
+times"* → 10 `new_tab` actions paced ~1.8 s apart. The pacing isn't just a UI
+nicety: firing many requests to the same site in one instant reads as a bot
+burst to sites' abuse detection — 10 near-simultaneous hits to
+`google.com/search` reliably tripped Google's "unusual traffic" interstitial
+on 8 of them before this fix; spaced out like a person actually opening tabs,
+all 10 come back as real results (`probe_multi_search_spacing.py`).
 
 **Auto-skip toggle** — the **⏭ Skip** toolbar button (or `Ctrl+Shift+S`) arms a
 persistent watcher that automatically clicks every YouTube skip button as it
@@ -282,6 +288,8 @@ anti-trace-browser/
 ├── probe_minimax.py     # MiniMax round-trip / valid-JSON-action test
 ├── probe_rules.py       # local rule parser sanity check
 ├── probe_multi.py       # multi-action arrays
+├── probe_search10.py    # "search randomly in google for 10 times" — rule/LLM routing + raw output
+├── probe_multi_search_spacing.py # multi new_tab actions are paced, not bursted
 ├── probe_pagetype.py    # page_type + same-tab sequencing
 ├── probe_clicklink.py   # link extraction + LLM picks the right one
 ├── probe_click.py       # click selector / text + ad-skip cases

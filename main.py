@@ -1636,6 +1636,15 @@ class AgentPanel(_AgentPrompt, wx.Panel):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # Minimum spacing between successive new-tab / same-tab-navigation actions
+    # when the agent issues several in one response. This isn't just a UI nicety:
+    # firing many requests to the same site in one instant (all in the same
+    # ~100ms UI tick) reads as a bot burst to sites' abuse detection — e.g.
+    # 10 near-simultaneous google.com/search hits reliably trip Google's
+    # "unusual traffic" interstitial on most of them. Spacing requests out like
+    # a person actually opening tabs one at a time avoids that pattern.
+    MULTI_ACTION_SPACING_MS = 1800
+
     def _finish_async(self, actions):
         self._busy = False
         if isinstance(actions, dict):
@@ -1656,17 +1665,20 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         closes.sort(key=lambda a: a.get("index", -1), reverse=True)
         ordered = non_close + closes
 
-        # If the agent issued multiple same-tab steps (page_type / navigate /
-        # search), space them out so each one is actually visible before the
-        # next replaces it. Otherwise they all race and only the last sticks.
+        # Same-tab steps (page_type / navigate / search) need a longer gap so
+        # each intermediate page is actually visible before being replaced.
+        # new_tab steps get a shorter gap — just enough to avoid a request
+        # burst — since each one lands in its own tab and stays visible.
         same_tab_kinds = {"page_type", "navigate", "search"}
-        same_tab_count = sum(1 for a in ordered if a.get("action") in same_tab_kinds)
-        if same_tab_count > 1:
+        paced_kinds = same_tab_kinds | {"new_tab"}
+        paced_count = sum(1 for a in ordered if a.get("action") in paced_kinds)
+        if paced_count > 1:
             delay_ms = 0
             for a in ordered:
-                if a.get("action") in same_tab_kinds:
+                kind = a.get("action")
+                if kind in paced_kinds:
                     wx.CallLater(delay_ms, lambda act=a: self._dispatch(act))
-                    delay_ms += 2500  # 2.5s between each — enough to see the page
+                    delay_ms += 2500 if kind in same_tab_kinds else self.MULTI_ACTION_SPACING_MS
                 else:
                     wx.CallLater(delay_ms, lambda act=a: self._dispatch(act))
             return
