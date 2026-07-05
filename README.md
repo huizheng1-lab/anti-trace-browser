@@ -118,8 +118,9 @@ form, tick a box, pick a dropdown option, scroll to find a button — it runs an
    selector guessing). Form fields are set via the native value setter so React
    sees the change; clicks fire a real pointer-event sequence.
 4. **Repeat** — re-observe and continue until the goal is met (the agent emits
-   `done`), capped at 8 steps with an oscillation guard that stops as soon as it
-   would repeat itself.
+   `done`). Step budget depends on the goal: 8 for a normal one-shot task, 24
+   for "select all the X" batch goals, and **60 for ongoing/multi-turn goals**
+   like games — see below.
 
 Because the observation reports current state (`value=…`, `[CHECKED]`,
 `selected=…`), the agent skips sub-tasks that are already done instead of
@@ -129,19 +130,36 @@ surrounding row/list-item — so the agent can pick the *right* row's control
 goals the step budget rises to 24 and the model may return an array of
 `click_element` actions to select many rows at once.
 
-**Verified end-to-end** with real MiniMax (`probe_agentic.py`):
+**Oscillation guard.** The loop stops early if it looks stuck — but "stuck"
+means the model chose the *same action* AND *the page's visible state (a
+whole-page text snapshot, not just the clicked element's own attributes)
+didn't change at all*. That distinction matters: clicking "Roll Dice" is the
+same action every turn in a dice game, but the turn counter/score text
+elsewhere on the page changes each time, so it's correctly recognized as
+progress rather than a loop stuck clicking a dead button.
 
-| Goal | Result |
-|---|---|
-| *"fill the form — name Bob Lee, email …, color Green, agree, Create account"* | All 5 fields/controls set correctly, form submitted ✓ |
-| *"select the promotional emails and move them to trash"* (6-row inbox) | Trashed exactly the 3 promo rows, left the 3 real emails untouched ✓ |
-| *"open the breaking news story about the park, then recommend the article"* | Picked the right story link (ignoring nav/ads), **navigated to the new page**, then clicked Recommend on it ✓ |
+**Ongoing goals (games, multi-turn processes).** Phrases like *"play a
+game"*, *"keep playing"*, *"each turn"* are detected and get a 60-step budget
+instead of 8, plus an explicit system-prompt instruction not to declare
+`done` after a single successful action — a game isn't finished after one
+turn. It keeps taking the next logical action (roll, buy, end turn, respond
+to a prompt) until the page shows a real end state or genuinely stops
+changing.
 
-The last case proves genuine **multi-page browsing**: click a link → wait for the
-new page to load (the loop polls `document.readyState` before re-observing) →
-act on the destination. Browse phrasings like *"open the top story"*, *"read the
-first article"*, *"go to the about page"*, *"click the first result"* all route
-into the loop automatically.
+**Verified end-to-end** with real MiniMax:
+
+| Goal | Result | Test |
+|---|---|---|
+| *"fill the form — name Bob Lee, email …, color Green, agree, Create account"* | All 5 fields/controls set correctly, form submitted ✓ | `probe_agentic.py` |
+| *"select the promotional emails and move them to trash"* (6-row inbox) | Trashed exactly the 3 promo rows, left the 3 real emails untouched ✓ | `probe_agentic.py` |
+| *"open the breaking news story about the park, then recommend the article"* | Picked the right story link (ignoring nav/ads), **navigated to the new page**, then clicked Recommend on it ✓ | `probe_browse.py` |
+| *"play a game — keep rolling the dice until the game ends"* (5-turn dice game) | Clicked Roll Dice across all 5 turns and correctly stopped at the real Game Over state — not after turn 1 ✓ | `probe_ongoing_game.py` |
+
+The multi-page case proves genuine **multi-page browsing**: click a link →
+wait for the new page to load (the loop polls `document.readyState` before
+re-observing) → act on the destination. Browse phrasings like *"open the top
+story"*, *"read the first article"*, *"go to the about page"*, *"click the
+first result"* all route into the loop automatically.
 
 Examples that drive the loop:
 
@@ -302,6 +320,7 @@ anti-trace-browser/
 ├── probe_search10.py    # "search randomly in google for 10 times" — rule/LLM routing + raw output
 ├── probe_multi_search_spacing.py # multi new_tab actions are paced, not bursted
 ├── probe_busy_recovery.py # busy-gate can't get stuck; errors surface, self-heals
+├── probe_ongoing_game.py # multi-turn game loop: plays all turns, stops at real Game Over
 ├── probe_pagetype.py    # page_type + same-tab sequencing
 ├── probe_clicklink.py   # link extraction + LLM picks the right one
 ├── probe_click.py       # click selector / text + ad-skip cases

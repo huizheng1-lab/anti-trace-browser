@@ -976,7 +976,16 @@ class _AgentPrompt:
         "   their own tabs. If user says 'same tab' or 'recycle the tab' or\n"
         "   'don't open new ones', use page_type (when on a search site) or\n"
         "   navigate (otherwise) — they'll be sequenced with a delay so each\n"
-        "   one is visible. Cap at 20 actions per response.\n\n"
+        "   one is visible. Cap at 20 actions per response.\n"
+        "7. GAMES / ONGOING GOALS ('play a game', 'keep playing', a multi-turn\n"
+        "   process): this is NOT a one-shot task. Take ONE reasonable action\n"
+        "   per turn (roll dice, buy/pass, end turn, answer a prompt, etc.)\n"
+        "   using the current [interactive elements] and never emit 'done'\n"
+        "   just because a single action succeeded. You'll be re-observed and\n"
+        "   asked again after every action — keep advancing the game turn by\n"
+        "   turn until it reaches a real end state (a 'Game Over'/'You win'\n"
+        "   screen, or the user's stated win/stop condition), or the page\n"
+        "   truly stops changing after you repeat the same move.\n\n"
         "EXAMPLES:\n"
         "User: do a random keyword search\n"
         '→ {"action":"search","query":"deep sea hydrothermal vents"}\n'
@@ -1023,6 +1032,12 @@ class _AgentPrompt:
         '{"action":"page_type","text":"monarch butterfly migration"},'
         '{"action":"page_type","text":"Andean cloud forests"},'
         '{"action":"page_type","text":"octopus intelligence"}]\n'
+        "User: play a game (GOAL says this is an ONGOING goal; elements show a "
+        "lobby with a 'Create Game' button and a name field)\n"
+        '→ {"action":"fill","index":0,"text":"Player"}   (next turn: '
+        '{"action":"click_element","index":1})   ... then keep responding to '
+        "each new turn's elements (Roll Dice, Buy, End Turn, etc.) — do NOT "
+        "emit done after the lobby step.\n"
     )
 
 # Static JS template for the click action — single triple-quoted string so we
@@ -1195,7 +1210,8 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         "Try: 'open YouTube'  |  'search for python pyqt6 tutorial'  |  "
         "'bookmark this'  |  'click the first result'  |  'fill the search box "
         "with cats and submit'  |  'check the agree box and click sign up'  |  "
-        "'scroll down and click load more'  |  'summarize this page'"
+        "'scroll down and click load more'  |  'summarize this page'  |  "
+        "'play a game' (keeps taking turns until it ends — press ■ Stop to end early)"
     )
 
     # JS that returns the most useful clickable links on the active page.
@@ -1365,12 +1381,22 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         }
         out.push(item);
       }
+      // Whole-page text snapshot — used ONLY internally to detect whether the
+      // page's visible state changed between steps (score counters, turn
+      // indicators, dice results, etc. that live outside the acted-upon
+      // element itself and wouldn't otherwise show up in any element's own
+      // attributes). Not sent to the model as part of the element list.
+      var pageText = '';
+      try {
+        pageText = (document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 3000);
+      } catch(_) {}
       return JSON.stringify({
         url: location.href.slice(0, 150),
         title: (document.title || '').slice(0, 100),
         scrollY: Math.round(window.scrollY),
         scrollMax: Math.round(Math.max(0, document.documentElement.scrollHeight - vh)),
         elements: out,
+        pageText: pageText,
       });
     })();
     """
@@ -1721,7 +1747,8 @@ class AgentPanel(_AgentPrompt, wx.Panel):
 
     # ---------- Gemini-style observe → act loop ----------
     MAX_AGENT_STEPS = 8
-    MAX_AGENT_STEPS_BATCH = 24  # higher budget for "select all the X and ..." tasks
+    MAX_AGENT_STEPS_BATCH = 24    # higher budget for "select all the X and ..." tasks
+    MAX_AGENT_STEPS_ONGOING = 60  # open-ended tasks: games, multi-turn processes
 
     @staticmethod
     def _is_batch_goal(goal: str) -> bool:
@@ -1732,6 +1759,20 @@ class AgentPanel(_AgentPrompt, wx.Panel):
             "archive the", "unsubscribe", "mark as read",
         ))
 
+    @staticmethod
+    def _is_ongoing_goal(goal: str) -> bool:
+        """Open-ended, multi-round tasks (games, repetitive processes) need a
+        much larger step budget and must NOT stop after one successful action
+        — 'play a game' means keep going turn after turn, not click one
+        button and declare victory."""
+        low = goal.lower()
+        return any(w in low for w in (
+            "play ", "game", "keep playing", "keep going", "continue playing",
+            "each turn", "every turn", "each round", "every round",
+            "until you win", "until it ends", "until game over",
+            "roll the dice", "take turns", "play against",
+        ))
+
     def _run_agentic_loop(self, goal: str):
         import time
         self._busy = True
@@ -1740,9 +1781,32 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         self._agent_goal = goal
         self._agent_steps = 0
         self._loop_last_sig = None
+        self._loop_last_obs_sig = None
         self._agent_messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
         self._append_styled("Agent", f"working on: {goal}", wx.Colour(0x5F, 0x63, 0x68))
         self._agent_step()
+
+    @staticmethod
+    def _observation_sig(obs: dict) -> str:
+        """Fingerprint of what the page currently looks like, so the
+        oscillation guard can tell 'nothing changed' apart from 'the board
+        state moved on but the same button is still the right one to press'
+        (e.g. clicking Roll Dice every turn in a game).
+
+        Crucially this includes a whole-page text snapshot, not just the
+        acted-upon element's own attributes — a "Roll Dice" button's label
+        never changes turn to turn, but the score/turn-counter text elsewhere
+        on the page does, and that's what actually proves progress happened.
+        """
+        els = obs.get("elements", []) or []
+        parts = []
+        for e in els:
+            parts.append("|".join(str(x) for x in (
+                e.get("i"), e.get("kind"), e.get("label"),
+                e.get("value", ""), e.get("checked", ""), e.get("selected", ""),
+            )))
+        page_text = obs.get("pageText", "") or ""
+        return "\x1e".join(parts) + "\x1d" + page_text
 
     @staticmethod
     def _action_sig(a: dict) -> str:
@@ -1806,8 +1870,12 @@ class AgentPanel(_AgentPrompt, wx.Panel):
             self._busy = False
 
     def _agent_step_body(self):
-        step_cap = (self.MAX_AGENT_STEPS_BATCH
-                    if self._is_batch_goal(self._agent_goal) else self.MAX_AGENT_STEPS)
+        if self._is_ongoing_goal(self._agent_goal):
+            step_cap = self.MAX_AGENT_STEPS_ONGOING
+        elif self._is_batch_goal(self._agent_goal):
+            step_cap = self.MAX_AGENT_STEPS_BATCH
+        else:
+            step_cap = self.MAX_AGENT_STEPS
         if self._agent_steps >= step_cap:
             self._append_styled("Agent", "(reached step limit — stopping)",
                                 wx.Colour(0x99, 0x99, 0x99))
@@ -1822,6 +1890,7 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         # Observe the active page (UI thread).
         obs = self.browser.observe_page()
         obs_block = self._format_observation(obs)
+        self._current_obs_sig = self._observation_sig(obs)
 
         # Tab context.
         active_idx = self.browser.book.GetSelection()
@@ -1830,8 +1899,24 @@ class AgentPanel(_AgentPrompt, wx.Panel):
             tabs_lines.append(f"  {i}: {(w.GetCurrentTitle() or '').strip()!r} @ {(w.GetCurrentURL() or '').strip()}")
         tabs_block = f"[tabs (active: {active_idx}):\n" + "\n".join(tabs_lines) + "\n]"
 
+        ongoing = self._is_ongoing_goal(self._agent_goal)
+        ongoing_note = (
+            "\nThis is an ONGOING/multi-round goal (e.g. a game or repetitive "
+            "process). Do NOT emit 'done' just because one action succeeded — "
+            "a game is not finished after one turn. Keep taking the next "
+            "logical action turn after turn (roll dice, buy/skip, end turn, "
+            "respond to prompts, etc.) using the CURRENT observation each "
+            "time. Only emit 'done' when the page itself shows a genuine end "
+            "state (e.g. 'Game Over', 'You win', a final results screen) or "
+            "when literally nothing on the page has changed since your last "
+            "action AND repeating it again did not change anything (truly "
+            "stuck) — repeating the SAME button across DIFFERENT turns is "
+            "normal and expected, not a sign of being stuck.\n"
+            if ongoing else ""
+        )
         user_turn = (
-            f"GOAL: {self._agent_goal}\n(step {self._agent_steps}/{self.MAX_AGENT_STEPS})\n\n"
+            f"GOAL: {self._agent_goal}\n(step {self._agent_steps}/{step_cap})\n"
+            f"{ongoing_note}\n"
             f"{tabs_block}\n{obs_block}\n"
             "Decide the next action(s) to advance the goal, using index-based "
             "actions (click_element/fill/select_option) against the elements above. "
@@ -1876,18 +1961,25 @@ class AgentPanel(_AgentPrompt, wx.Panel):
         self._agent_messages.append({"role": "assistant", "content": raw})
         acts = self._parse_actions(raw) or [{"action": "reply", "text": raw}]
 
-        # Oscillation guard: if the model repeats the exact same action it just
-        # did, the goal is almost certainly already complete — stop cleanly.
+        # Oscillation guard: only conclude "done" when the model repeats the
+        # exact same action AND the page itself is unchanged since that same
+        # action was last taken — i.e. truly stuck (clicking a dead button).
+        # For ongoing tasks like games, choosing the same button turn after
+        # turn (e.g. "Roll Dice") is normal as long as the board/observation
+        # actually changed in between — that must NOT be flagged as done.
+        cur_obs_sig = getattr(self, "_current_obs_sig", None)
         if acts:
             sig = self._action_sig(acts[0])
-            if sig and sig == getattr(self, "_loop_last_sig", None) \
-                    and acts[0].get("action") not in ("done", "reply"):
+            same_action = sig and sig == getattr(self, "_loop_last_sig", None)
+            same_page = cur_obs_sig is not None and cur_obs_sig == getattr(self, "_loop_last_obs_sig", None)
+            if same_action and same_page and acts[0].get("action") not in ("done", "reply"):
                 self._append_styled("Agent",
-                                    "✓ done (no further progress — the goal looks complete)",
+                                    "✓ done (page unchanged after repeating the same action — looks stuck/complete)",
                                     wx.Colour(0x0F, 0x80, 0x0F))
                 self._busy = False
                 return
             self._loop_last_sig = sig
+            self._loop_last_obs_sig = cur_obs_sig
 
         terminal = False
         for a in acts:
