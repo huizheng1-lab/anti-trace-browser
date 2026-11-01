@@ -31,6 +31,8 @@ os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
     "--disable-features=AutofillServerCommunication,OptimizationHints"
 )
 
+from autoskip import AUTOSKIP_JS
+
 import wx
 import wx.html2
 import wx.aui
@@ -2594,7 +2596,7 @@ class Browser(wx.Frame):
         y = max(client_rect.GetTop() + 20, client_rect.GetTop() + (screen_h - h) // 2)
         self.SetPosition(wx.Point(x, y))
 
-        # Auto-skip YouTube ads is ON by default. Disable with the ⏭ Skip
+        # Auto-skip available ad buttons is ON by default. Disable with the ⏭ Skip
         # toolbar button, Ctrl+Shift+S, or "stop" in the agent.
         self.set_autoskip(True)
 
@@ -2629,7 +2631,7 @@ class Browser(wx.Frame):
         self.btn_autoskip.SetBackgroundColour(CHROME_BG)
         self.btn_autoskip.SetForegroundColour(wx.Colour(0x20, 0x21, 0x24))
         self.btn_autoskip.SetFont(wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
-        self.btn_autoskip.SetToolTip("Auto-skip YouTube ads (off) — click to turn on")
+        self.btn_autoskip.SetToolTip("Auto-skip available ad buttons (off) — click to turn on")
         self.btn_wipe   = wx.Button(bar, id=ID_WIPE, label="Wipe", size=wx.Size(64, 32),
                                     style=wx.BORDER_NONE)
         self.btn_wipe.SetBackgroundColour(wx.Colour(0xC0, 0x39, 0x2B))
@@ -2938,7 +2940,7 @@ class Browser(wx.Frame):
             self._autoskip_clicks = 0
             self._autoskip_last_click = 0.0
             self.GetStatusBar().SetStatusText(
-                "🔄 Auto-skip ON — ads will be skipped automatically on every tab", 0)
+                "🔄 Auto-skip ON — available ad buttons will be clicked in the active tab", 0)
             self._autoskip_timer.Start(600)
         else:
             self._autoskip_timer.Stop()
@@ -2950,11 +2952,16 @@ class Browser(wx.Frame):
         # The timer auto-stops on destroy, but guard anyway.
         if not getattr(self, "_autoskip_on", False) or not getattr(self, "_alive", True):
             return
+        # Never send mouse input into a covered, background or minimized browser.
+        if not self.IsActive() or self.IsIconized():
+            return
+        if (time.time() - self._autoskip_last_click) <= 2.5:
+            return
         wv = self.get_active_webview()  # follow whichever tab is active
         if wv is None:
             return
         try:
-            js = self._LOCATE_JS % (json.dumps(self._AUTOSKIP_SELECTORS), "null")
+            js = AUTOSKIP_JS
             ok, raw = wv.RunScript(js)
             data = json.loads(raw) if raw else {}
         except Exception:
@@ -2966,11 +2973,23 @@ class Browser(wx.Frame):
             wv_screen = wv.ClientToScreen(wx.Point(0, 0))
             sx = int(wv_screen.x + data["x"])
             sy = int(wv_screen.y + data["y"])
+            # Hit-test native child ownership immediately before the trusted click.
+            # WebView2 owns native child HWNDs that wx cannot resolve to widgets.
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = wintypes.HWND
+            hit = user32.WindowFromPoint(wintypes.POINT(sx, sy))
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            if not self.IsActive() or not hit or user32.GetAncestor(hit, 2) != self.GetHandle():
+                return
             self._do_os_click(sx, sy)
             self._autoskip_last_click = time.time()
             self._autoskip_clicks += 1
             self.GetStatusBar().SetStatusText(
-                f"🔄 Auto-skip ON — skipped {self._autoskip_clicks} ad(s)", 0)
+                f"🔄 Auto-skip ON — sent {self._autoskip_clicks} ad skip click(s)", 0)
 
     def _refresh_autoskip_button(self):
         btn = getattr(self, "btn_autoskip", None)
@@ -2986,7 +3005,7 @@ class Browser(wx.Frame):
             btn.SetLabel("⏭ Skip")
             btn.SetBackgroundColour(CHROME_BG)
             btn.SetForegroundColour(wx.Colour(0x20, 0x21, 0x24))
-            btn.SetToolTip("Auto-skip YouTube ads (off) — click to turn on")
+            btn.SetToolTip("Auto-skip available ad buttons (off) — click to turn on")
         btn.Refresh()
 
     def _agent_log(self, msg: str, color):
